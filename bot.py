@@ -816,32 +816,18 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
 
     parsed_nft = parse_nft_command(text)
 
-    # The BUYER sends `.nft <price> <gift link>` in the private chat with
-    # the connected Business account. The seller is the Business account owner.
-    if not is_owner_message and parsed_nft:
-        if not sender:
-            logger.warning("Cannot process buyer NFT command: Business message has no sender user")
-            return
-
-        buyer_id = int(sender.id)
-        # Prefer the live Business connection owner; if Telegram does not return
-        # connection metadata after a restart, use the optional configured seller ID.
-        # Zero keeps the offer card renderable instead of silently dropping it.
-        owner_value = connection_info.get("user_id") if connection_info else None
-        if not owner_value:
-            owner_value = os.getenv("SELLER_TELEGRAM_ID", "").strip()
-        try:
-            seller_id = int(owner_value) if owner_value else 0
-        except (TypeError, ValueError):
-            logger.warning("SELLER_TELEGRAM_ID is invalid; offer will use preview button permissions")
-            seller_id = 0
-        buyer_username = getattr(sender, "username", None)
-        buyer_first_name = getattr(sender, "first_name", None)
+    # The CONNECTED BUSINESS ACCOUNT OWNER writes `.nft <price> <gift link>`
+    # in the buyer's private chat. The bot publishes the card in that same
+    # Business chat, then deletes the owner's command. It must not create cards
+    # in the bot's own DM.
+    if is_owner_message and parsed_nft:
+        seller_id = int(connection_info["user_id"]) if connection_info and connection_info.get("user_id") else 0
+        buyer_id = int(message.chat_id)
+        chat = message.chat
+        buyer_username = getattr(chat, "username", None)
+        buyer_first_name = getattr(chat, "first_name", None)
         buyer_name = f"@{buyer_username}" if buyer_username else (buyer_first_name or f"Покупатель {buyer_id}")
 
-        # Send the card first. Never remove the buyer's command unless the card
-        # was successfully created; otherwise a temporary API/permission problem
-        # would leave the chat with neither the command nor a card.
         sent_ok = await handle_nft_command(
             message, context, connection_id, *parsed_nft,
             seller_id, buyer_id, buyer_name,
@@ -852,24 +838,18 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
                     business_connection_id=connection_id,
                     message_ids=[message.message_id],
                 )
+                logger.info("Deleted owner's .nft command after card send: chat_id=%s message_id=%s", message.chat_id, message.message_id)
             except (AttributeError, TelegramError) as exc:
-                logger.warning("Could not delete buyer's .nft command in Business chat: %s", exc)
+                logger.warning("Card sent but could not delete owner's .nft command: %s", exc)
         return
 
-    # Don't answer the owner's outgoing messages, and don't send an away reply
-    # to malformed `.nft` attempts from the buyer.
-    if is_owner_message:
+    # Ignore `.nft` messages from the buyer; the connected account owner creates
+    # the offer by typing the command in this Business conversation.
+    if parsed_nft or re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
         return
-    if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
-        try:
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                business_connection_id=connection_id,
-                text="Формат: .nft 3500 t.me/nft/LibertyFigure-14469",
-                disable_web_page_preview=True,
-            )
-        except TelegramError as exc:
-            logger.warning("Could not send NFT command format hint: %s", exc)
+
+    # Never auto-reply to messages authored by the Business account owner.
+    if is_owner_message:
         return
 
     # Away reply for ordinary incoming messages. A real Premium sticker must be
@@ -944,9 +924,7 @@ async def lifespan(fastapi_app: FastAPI):
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
     telegram_app.add_handler(MessageHandler(filters.Sticker.ALL, show_sticker_file_id))
     telegram_app.add_handler(CallbackQueryHandler(button_router))
-    # `.nft` is not a Telegram slash-command, so it needs a text handler in the
-    # bot's own private chat. Business-chat commands are handled above.
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, direct_nft_command))
+    # `.nft` is handled only from the connected account's Business chat.
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_offer))
 
     await telegram_app.initialize()
