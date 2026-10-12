@@ -51,23 +51,13 @@ def warning_footer() -> str:
 
 
 def welcome_text() -> str:
-    return (
-        "<b>NEZZX — предложения и сделки</b>\n\n"
-        "Создайте предложение с описанием условий, затем отправьте карточку второму участнику.\n\n"
-        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Важно:</b> бот не принимает, не хранит и не переводит деньги. "
-        "Он не является эскроу-сервисом и не подтверждает факт оплаты."
-        + warning_footer()
-    )
+    # The private bot is only an entry point; deals are handled in Business chats.
+    return "Сделки тут."
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Создать предложение", callback_data="create_offer")],
-            [InlineKeyboardButton("Безопасная сделка", callback_data="safe_deal")],
-            [InlineKeyboardButton("Как это работает", callback_data="how_it_works")],
-        ]
-    )
+def main_keyboard() -> InlineKeyboardMarkup | None:
+    # No deal-creation menu in the bot's private chat.
+    return None
 
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
@@ -106,15 +96,12 @@ async def safe_edit_text(query: Any, text: str, **kwargs: Any) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_offer", None)
+    context.user_data.pop("awaiting_business_offer", None)
+    context.user_data.pop("business_connection_id", None)
     context.user_data.pop("flow_message_id", None)
     message = update.effective_message
     if message is not None:
-        await message.reply_text(
-            welcome_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-            disable_web_page_preview=True,
-        )
+        await message.reply_text("Сделки тут.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -697,7 +684,6 @@ async def handle_nft_command(
             text=card,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
-            reply_to_message_id=message.message_id,
             disable_web_page_preview=True,
         )
         key = f"{sent.chat_id}:{sent.message_id}"
@@ -765,7 +751,7 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 business_connection_id=connection_id,
-                text="Команду покупки должен отправить покупатель в этом чате.",
+                text="Команду покупки должен отправить покупатель в этом чате: .nft 3500 t.me/nft/LibertyFigure-14469",
             )
             return
         if not sender:
@@ -792,60 +778,40 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     lowered = text.lower()
-    if context.user_data.get("awaiting_business_offer"):
-        await _finish_business_offer(message, context, connection_id)
-        return
-
-    if lowered in {"/cancel", "отмена"}:
-        context.user_data.pop("awaiting_business_offer", None)
-        context.user_data.pop("business_connection_id", None)
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Сейчас нет активного создания предложения.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    if "создать предложение" in lowered or lowered == "предложение":
-        context.user_data["awaiting_business_offer"] = True
-        context.user_data["business_connection_id"] = connection_id
-        prompt = await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text=(
-                "<b>Создание предложения</b>\n\n"
-                "Отправьте одним сообщением описание предложения и условия.\n"
-                "Не указывайте пароли, коды подтверждения или полные данные банковских карт."
-                + warning_footer()
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_keyboard(),
-        )
-        context.user_data["flow_chat_id"] = prompt.chat_id
-        context.user_data["flow_message_id"] = prompt.message_id
-        return
-
-    # Business chats now get a visible response to ordinary incoming text as well,
-    # not only to /start or a special phrase.
-    response = (
-        "<b>NEZZX — предложения и сделки</b>\n\n"
-        "Здравствуйте! Я помогу оформить карточку предложения. Выберите действие ниже "
-        "или напишите «создать предложение».\n\n"
-        "Бот не принимает и не хранит деньги и не подтверждает оплату."
-        + warning_footer()
-    )
+    # Away reply for ordinary incoming messages. A real Premium sticker must be
+    # configured via PREMIUM_STICKER_FILE_ID (Telegram sticker file_id), since a
+    # custom emoji ID is not a sticker file_id. Never send the generic menu reply.
     try:
+        sticker_id = os.getenv("PREMIUM_STICKER_FILE_ID", "").strip()
+        if sticker_id:
+            try:
+                await context.bot.send_sticker(
+                    chat_id=message.chat_id,
+                    sticker=sticker_id,
+                    business_connection_id=connection_id,
+                )
+            except TelegramError as sticker_exc:
+                logger.warning("Could not send configured away sticker: %s", sticker_exc)
+
         await context.bot.send_message(
             chat_id=message.chat_id,
             business_connection_id=connection_id,
-            text=response,
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
+            text="Привет... Незкс сейчас вернётся, либо он спит, а может быть и занят... Просто жди.",
             disable_web_page_preview=True,
         )
     except TelegramError as exc:
-        logger.exception("Could not reply in Telegram Business chat: %s", exc)
+        logger.exception("Could not send Business away reply: %s", exc)
+
+
+async def show_sticker_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return the file_id for a sticker sent to the bot in its private chat."""
+    message = update.effective_message
+    if message is None or message.sticker is None:
+        return
+    await message.reply_text(
+        "STICKER_FILE_ID для Render:\n" + message.sticker.file_id,
+        disable_web_page_preview=True,
+    )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -882,6 +848,7 @@ async def lifespan(fastapi_app: FastAPI):
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
+    telegram_app.add_handler(MessageHandler(filters.Sticker.ALL, show_sticker_file_id))
     telegram_app.add_handler(CallbackQueryHandler(button_router))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_offer))
 
