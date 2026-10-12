@@ -442,7 +442,7 @@ async def lifespan(fastapi_app: FastAPI):
         raise RuntimeError("RENDER_EXTERNAL_URL was not found. Set WEBHOOK_URL to your Render HTTPS service URL.")
 
     telegram_app = Application.builder().token(token).build()
-    telegram_app.add_handler(TypeHandler(Update, business_connection_update, filters=filters.UpdateType.BUSINESS_CONNECTION))
+    telegram_app.add_handler(TypeHandler(Update, business_connection_update), group=1)
     telegram_app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, business_message_reply))
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_command))
