@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -538,6 +539,58 @@ async def _finish_business_offer(
             logger.info("Could not update Business prompt in place: %s", exc)
 
 
+def parse_nft_command(text: str) -> tuple[str, str] | None:
+    """Parse `.nft <amount> <URL>`; return amount and URL, or None."""
+    match = re.match(r"^\.nft\s+(\d+(?:[.,]\d{1,2})?)\s+(https?://\S+)\s*$", text.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    amount = match.group(1).replace(",", ".")
+    url = match.group(2).rstrip(".,)")
+    if not url.startswith(("https://", "http://")):
+        return None
+    return amount, url
+
+
+async def handle_nft_command(message: Any, context: ContextTypes.DEFAULT_TYPE, connection_id: str, amount: str, url: str) -> None:
+    """Turn the owner's `.nft amount URL` message into a formatted card in-place if allowed."""
+    safe_url = html.escape(url, quote=True)
+    card = (
+        f"<b>{custom_emoji(EMOJI_OFFER, '📨')} Предложение NFT</b>\n\n"
+        f"<b>Цена:</b> {html.escape(amount)}\n"
+        f"<b>Ссылка:</b> <a href=\"{safe_url}\">Открыть NFT</a>\n\n"
+        f"{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Подтверждение:</b> ожидается\n"
+        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Проверка:</b> ссылка и цена не проверены ботом"
+        + warning_footer()
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            business_connection_id=connection_id,
+            text=card,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Подтвердить условия", callback_data=f"confirm:{message.from_user.id if message.from_user else 0}"),
+                 InlineKeyboardButton("Отклонить", callback_data=f"reject:{message.from_user.id if message.from_user else 0}")],
+                [InlineKeyboardButton("Безопасная сделка — информация", callback_data=f"safe:{message.from_user.id if message.from_user else 0}")],
+            ]),
+            disable_web_page_preview=True,
+        )
+        logger.info(".nft command edited in place: chat_id=%s message_id=%s", message.chat_id, message.message_id)
+    except TelegramError as exc:
+        logger.warning("Could not edit .nft Business message in-place; sending card instead: %s", exc)
+        try:
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                business_connection_id=connection_id,
+                text=card,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except TelegramError:
+            logger.exception("Could not send .nft Business card")
+
+
 async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process normal text in Telegram Business chats and reply on behalf of the account."""
     message = update.business_message
@@ -565,10 +618,22 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     sender = message.from_user
-    if sender and connection_info and sender.id == connection_info.get("user_id"):
-        # The connected account owner sent this message; do not auto-reply to the owner.
-        return
+    is_owner_message = bool(sender and connection_info and sender.id == connection_info.get("user_id"))
     if getattr(message, "sender_business_bot", False):
+        return
+
+    # Owner-authored commands must be checked BEFORE ignoring ordinary messages from the owner.
+    # Previously `.nft 2300 https://...` hit the owner guard and was silently discarded.
+    if is_owner_message:
+        parsed_nft = parse_nft_command(text)
+        if parsed_nft:
+            await handle_nft_command(message, context, connection_id, *parsed_nft)
+        elif text.lower().startswith(".nft"):
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                business_connection_id=connection_id,
+                text="Формат команды: .nft 2300 https://ссылка-на-nft",
+            )
         return
 
     lowered = text.lower()
