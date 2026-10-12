@@ -107,12 +107,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is not None:
-        await message.reply_text(
-            "Нажмите «Создать предложение» и отправьте текст с условиями. "
-            "Бот создаст карточку с кнопками подтверждения и отклонения.\n\n"
-            "Подтверждение означает только согласие с текстом карточки. Оно не доказывает оплату. "
-            "Не сообщайте коды входа, пароли или данные банковских карт."
-        )
+        await message.reply_text("Сделки оформляются в личном чате через подключённый Telegram Business.")
 
 
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -369,7 +364,7 @@ async def receive_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data.pop("awaiting_offer", None)
         context.user_data.pop("flow_chat_id", None)
         context.user_data.pop("flow_message_id", None)
-        await message.reply_text("Создание предложения отменено.", reply_markup=main_keyboard())
+        await message.reply_text("Отменено.")
         return
 
     if len(description) > MAX_OFFER_LENGTH:
@@ -743,41 +738,44 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
     if getattr(message, "sender_business_bot", False):
         return
 
-    # NFT purchase command is sent by the buyer in the seller's Business chat.
-    # Do not treat the connected account owner as the buyer of their own gift.
+    # The connected account owner types .nft themselves in the private Business
+    # chat with the buyer. In a private chat, message.chat_id identifies the peer.
     parsed_nft = parse_nft_command(text)
-    if parsed_nft:
-        if is_owner_message:
+    if is_owner_message:
+        if parsed_nft:
+            seller_id = int(connection_info.get("user_id") or sender.id)
+            buyer_id = int(message.chat_id)
+            chat = message.chat
+            buyer_username = getattr(chat, "username", None)
+            buyer_first_name = getattr(chat, "first_name", None)
+            buyer_name = (
+                f"@{buyer_username}" if buyer_username
+                else (buyer_first_name or f"Покупатель {buyer_id}")
+            )
+            # Delete the owner's command immediately, then send the replacement card.
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=connection_id,
+                    message_ids=[message.message_id],
+                )
+            except (AttributeError, TelegramError) as exc:
+                logger.warning("Could not delete owner's .nft command in Business chat: %s", exc)
+            await handle_nft_command(
+                message, context, connection_id, *parsed_nft,
+                seller_id, buyer_id, buyer_name,
+            )
+        elif re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 business_connection_id=connection_id,
-                text="Команду покупки должен отправить покупатель в этом чате: .nft 3500 t.me/nft/LibertyFigure-14469",
+                text="Формат: .nft 3500 t.me/nft/LibertyFigure-14469",
             )
-            return
-        if not sender:
-            return
-        seller_id = int(connection_info.get("user_id") or 0) if connection_info else 0
-        if not seller_id:
-            logger.warning("Could not identify Business account owner for NFT offer: %s", connection_id)
-            return
-        buyer_name = f"@{sender.username}" if sender.username else (sender.full_name or f"Покупатель {sender.id}")
-        await handle_nft_command(
-            message, context, connection_id, *parsed_nft,
-            seller_id, sender.id, buyer_name,
-        )
-        return
-    if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Формат: .nft 3000 t.me/nft/LibertyFigure-14469",
-        )
         return
 
-    if is_owner_message:
+    # Customer messages do not create generic offers; only the owner's .nft command does.
+    if parsed_nft or re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
         return
 
-    lowered = text.lower()
     # Away reply for ordinary incoming messages. A real Premium sticker must be
     # configured via PREMIUM_STICKER_FILE_ID (Telegram sticker file_id), since a
     # custom emoji ID is not a sticker file_id. Never send the generic menu reply.
@@ -822,7 +820,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.pop("flow_message_id", None)
     message = update.effective_message
     if message is not None:
-        await message.reply_text("Создание предложения отменено.", reply_markup=main_keyboard())
+        await message.reply_text("Отменено.")
 
 
 @asynccontextmanager
