@@ -243,6 +243,58 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    # Compact NFT purchase workflow: only the connected business-account owner
+    # may accept or reject a buyer's offer.
+    if data.startswith(("nft_accept:", "nft_reject:")):
+        try:
+            action, seller_text, buyer_text = data.split(":", maxsplit=2)
+            seller_id = int(seller_text)
+            buyer_id = int(buyer_text)
+        except (ValueError, TypeError):
+            await query.answer("Предложение некорректно.", show_alert=True)
+            return
+
+        actor = query.from_user
+        if actor.id != seller_id:
+            await query.answer("Решение может принять только владелец Business-аккаунта.", show_alert=True)
+            return
+
+        message = query.message
+        if message is None:
+            await query.answer("Сообщение недоступно.", show_alert=True)
+            return
+
+        offer_key = f"{message.chat_id}:{message.message_id}"
+        states: dict[str, dict[str, Any]] = context.bot_data.setdefault("offer_states", {})
+        if offer_key in states:
+            await query.answer("По этому предложению уже принято решение.", show_alert=True)
+            return
+
+        states[offer_key] = {"action": action, "seller_id": seller_id, "buyer_id": buyer_id}
+        if action == "nft_accept":
+            result_text = (
+                "<b>Предложение принято</b>\n\n"
+                "Откройте меню подарков Telegram и выберите покупателя вручную. "
+                "Бот не может сам подтвердить или выполнить передачу коллекционного NFT."
+            )
+            result_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть меню подарков", url="tg://settings/send-gift")]
+            ])
+            await query.answer("Предложение принято")
+        else:
+            result_text = "<b>Предложение отклонено</b>"
+            result_keyboard = None
+            await query.answer("Предложение отклонено")
+
+        await safe_edit_text(
+            query,
+            result_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
     parts = data.split(":", maxsplit=1)
     if len(parts) != 2 or parts[0] not in {"confirm", "reject", "safe"}:
         await query.answer("Неизвестное действие.", show_alert=True)
@@ -608,74 +660,36 @@ async def handle_nft_command(
     connection_id: str,
     amount: str,
     url: str,
-    owner_id: int,
-    owner_name: str,
+    seller_id: int,
+    buyer_id: int,
+    buyer_name: str,
 ) -> None:
-    """Replace the command message with a fully formatted NFT offer card."""
+    """Send a short NFT purchase offer on behalf of the connected Business account."""
     from urllib.parse import urlsplit
 
     safe_url = html.escape(url, quote=True)
     collectible_name, collectible_number = _nft_details(url)
     display_amount = html.escape(_format_amount(amount))
-    display_name = html.escape(owner_name or "NEZZX")
-    is_telegram_nft = (urlsplit(url).hostname or "").lower() in {
-        "t.me", "www.t.me", "telegram.me", "www.telegram.me"
-    }
-    asset_label = "Коллекционный подарок Telegram" if is_telegram_nft else "Цифровой коллекционный объект"
+    safe_buyer = html.escape(buyer_name or "Покупатель")
+    host = (urlsplit(url).hostname or "").lower()
+    is_telegram_nft = host in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
 
+    # Keep the offer deliberately compact: buyer, amount, gift link, two actions only.
     card = (
-        f"<b>{custom_emoji(EMOJI_OFFER, '📨')} NEZZX NFT СКУП</b>\n"
-        "<i>Предложение о покупке</i>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"{custom_emoji(EMOJI_STARS, '⭐')} <b>Сумма предложения:</b> <code>{display_amount}</code>\n"
-        f"<b>Объект:</b> {html.escape(collectible_name)}\n"
-        f"<b>Номер:</b> {html.escape(collectible_number)}\n"
-        f"<b>Тип:</b> {asset_label}\n"
-        f"<b>Ссылка:</b> <a href=\"{safe_url}\">Открыть NFT в Telegram</a>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Статус:</b> ожидает ответа\n"
-        f"<b>Инициатор:</b> {display_name}\n"
-        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Условия:</b> проверьте объект и сумму перед согласием\n"
-        f"{custom_emoji(EMOJI_STARS, '⭐')} <b>Рейтинг:</b> не указан\n\n"
-        "<b>Действие:</b> получатель может подтвердить или отклонить предложение.\n"
-        "Подтверждение означает согласие с указанными условиями и само по себе не подтверждает оплату или передачу NFT."
-        + warning_footer()
+        f"<b>{safe_buyer}</b> хочет купить ваш подарок за "
+        f"<b>{custom_emoji(EMOJI_STARS, '⭐')} {display_amount}</b> звёзд\n\n"
+        f"<b>{html.escape(collectible_name)}</b> · {html.escape(collectible_number)}\n"
+        f"<a href=\"{safe_url}\">Ссылка на подарок</a>"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Открыть NFT", url=url)],
         [
-            InlineKeyboardButton("Подтвердить предложение", callback_data=f"confirm:{owner_id}"),
-            InlineKeyboardButton("Отклонить", callback_data=f"reject:{owner_id}"),
-        ],
-        [InlineKeyboardButton("Безопасная сделка — информация", callback_data=f"safe:{owner_id}")],
+            InlineKeyboardButton("Принять", callback_data=f"nft_accept:{seller_id}:{buyer_id}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"nft_reject:{seller_id}:{buyer_id}"),
+        ]
     ])
 
-    edited = False
-    try:
-        await context.bot.edit_message_text(
-            chat_id=message.chat_id,
-            message_id=message.message_id,
-            business_connection_id=connection_id,
-            text=card,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-        edited = True
-        logger.info(".nft command edited in place: chat_id=%s message_id=%s", message.chat_id, message.message_id)
-    except TelegramError as exc:
-        logger.warning(
-            "Could not replace .nft Business message in-place (chat_id=%s message_id=%s): %s",
-            message.chat_id, message.message_id, exc,
-        )
-
-    # Keep callback actions working for both in-place edit and fallback send.
-    if edited:
-        key = f"{message.chat_id}:{message.message_id}"
-        cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
-        cards[key] = card
-        return
-
+    # The incoming customer's message cannot reliably be replaced by the bot.
+    # Send a formatted Business reply instead of silently failing to edit their message.
     try:
         sent = await context.bot.send_message(
             chat_id=message.chat_id,
@@ -683,23 +697,33 @@ async def handle_nft_command(
             text=card,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
+            reply_to_message_id=message.message_id,
             disable_web_page_preview=True,
         )
         key = f"{sent.chat_id}:{sent.message_id}"
         cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
         cards[key] = card
-        logger.info(".nft fallback card sent: chat_id=%s message_id=%s", sent.chat_id, sent.message_id)
+        offers: dict[str, dict[str, Any]] = context.bot_data.setdefault("nft_offers", {})
+        offers[key] = {
+            "seller_id": seller_id,
+            "buyer_id": buyer_id,
+            "buyer_name": buyer_name,
+            "amount": amount,
+            "url": url,
+            "business_connection_id": connection_id,
+            "is_telegram_nft": is_telegram_nft,
+        }
+        logger.info("NFT offer card sent: chat_id=%s message_id=%s buyer_id=%s", sent.chat_id, sent.message_id, buyer_id)
     except TelegramError as exc:
-        logger.exception("Could not send .nft Business card after edit failed: %s", exc)
+        logger.exception("Could not send NFT offer card: %s", exc)
         try:
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 business_connection_id=connection_id,
-                text=("Не удалось оформить NFT-предложение. Проверьте право Business-бота отвечать на сообщения "
-                      "и доступ к этому чату, затем попробуйте ещё раз."),
+                text="Не удалось отправить предложение. Проверьте разрешение Business-бота отвечать в этом чате.",
             )
         except TelegramError:
-            logger.exception("Could not send .nft error message")
+            logger.exception("Could not send NFT offer error message")
 
 
 async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -733,24 +757,38 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
     if getattr(message, "sender_business_bot", False):
         return
 
-    # Owner-authored commands must be checked BEFORE ignoring ordinary messages from the owner.
-    # Previously `.nft 2300 https://...` hit the owner guard and was silently discarded.
-    if is_owner_message:
-        parsed_nft = parse_nft_command(text)
-        if parsed_nft:
-            owner_id = int(connection_info.get("user_id") or sender.id)
-            owner_name = str(connection_info.get("user_name") or sender.full_name or "NEZZX")
-            await handle_nft_command(message, context, connection_id, *parsed_nft, owner_id, owner_name)
-        elif re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
+    # NFT purchase command is sent by the buyer in the seller's Business chat.
+    # Do not treat the connected account owner as the buyer of their own gift.
+    parsed_nft = parse_nft_command(text)
+    if parsed_nft:
+        if is_owner_message:
             await context.bot.send_message(
                 chat_id=message.chat_id,
                 business_connection_id=connection_id,
-                text=(
-                    "Не смог разобрать команду. Пример:\n"
-                    ".nft 3000 t.me/nft/LibertyFigure-14469\n\n"
-                    "Поддерживаются как t.me/nft/..., так и полные ссылки https://..."
-                ),
+                text="Команду покупки должен отправить покупатель в этом чате.",
             )
+            return
+        if not sender:
+            return
+        seller_id = int(connection_info.get("user_id") or 0) if connection_info else 0
+        if not seller_id:
+            logger.warning("Could not identify Business account owner for NFT offer: %s", connection_id)
+            return
+        buyer_name = f"@{sender.username}" if sender.username else (sender.full_name or f"Покупатель {sender.id}")
+        await handle_nft_command(
+            message, context, connection_id, *parsed_nft,
+            seller_id, sender.id, buyer_name,
+        )
+        return
+    if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text="Формат: .nft 3000 t.me/nft/LibertyFigure-14469",
+        )
+        return
+
+    if is_owner_message:
         return
 
     lowered = text.lower()
