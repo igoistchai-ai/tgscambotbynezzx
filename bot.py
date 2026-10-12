@@ -237,8 +237,15 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         actor = query.from_user
-        if actor.id != seller_id:
-            await query.answer("Решение может принять только владелец Business-аккаунта.", show_alert=True)
+        # seller_id == 0 means this card was generated in the bot's ordinary
+        # private chat as a visual preview, where no Business owner can be inferred.
+        # In that mode, the buyer cannot accept their own offer; a different account
+        # may operate the buttons if the card is forwarded/shared.
+        if seller_id and actor.id != seller_id:
+            await query.answer("Решение может принять только продавец.", show_alert=True)
+            return
+        if not seller_id and actor.id == buyer_id:
+            await query.answer("Покупатель не может принять собственное предложение.", show_alert=True)
             return
 
         message = query.message
@@ -430,6 +437,45 @@ async def receive_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         except TelegramError as exc:
             logger.info("Could not update flow message in place: %s", exc)
+
+
+async def direct_nft_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Accept .nft in the bot's own private chat as well as Business chats.
+
+    A plain bot DM has no Business connection, so it can only create the offer card
+    inside that bot chat. The connected-account workflow remains handled separately
+    by business_message_reply().
+    """
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or not message.text:
+        return
+
+    text = message.text.strip()
+    if not re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
+        return
+
+    parsed = parse_nft_command(text)
+    if not parsed:
+        await message.reply_text("Формат команды: .nft 1000 t.me/nft/LibertyFigure-14469")
+        return
+
+    configured_seller = os.getenv("SELLER_TELEGRAM_ID", "").strip()
+    try:
+        seller_id = int(configured_seller) if configured_seller else 0
+    except ValueError:
+        logger.warning("SELLER_TELEGRAM_ID is invalid; using preview mode for direct bot chats")
+        seller_id = 0
+    if seller_id == user.id:
+        seller_id = 0
+
+    username = getattr(user, "username", None)
+    first_name = getattr(user, "first_name", None)
+    buyer_name = f"@{username}" if username else (first_name or f"Покупатель {user.id}")
+    logger.info("Direct .nft command received: chat_id=%s user_id=%s", message.chat_id, user.id)
+    await handle_nft_command(
+        message, context, None, parsed[0], parsed[1], seller_id, user.id, buyer_name
+    )
 
 
 async def business_connection_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -639,13 +685,13 @@ def _format_amount(amount: str) -> str:
 async def handle_nft_command(
     message: Any,
     context: ContextTypes.DEFAULT_TYPE,
-    connection_id: str,
+    connection_id: str | None,
     amount: str,
     url: str,
     seller_id: int,
     buyer_id: int,
     buyer_name: str,
-) -> None:
+) -> bool:
     """Send a short NFT purchase offer on behalf of the connected Business account."""
     from urllib.parse import urlsplit
 
@@ -680,14 +726,16 @@ async def handle_nft_command(
     sent = None
     sent_card = card
     try:
-        sent = await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text=card,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
+        send_kwargs: dict[str, Any] = {
+            "chat_id": message.chat_id,
+            "text": card,
+            "parse_mode": ParseMode.HTML,
+            "reply_markup": keyboard,
+            "disable_web_page_preview": True,
+        }
+        if connection_id:
+            send_kwargs["business_connection_id"] = connection_id
+        sent = await context.bot.send_message(**send_kwargs)
     except TelegramError as rich_exc:
         # Most common recoverable failure is a rejected custom-emoji entity.
         # Retry the same offer card without custom-emoji markup; don't show a
@@ -695,27 +743,24 @@ async def handle_nft_command(
         logger.warning("Rich NFT card failed; retrying plain card: %s", rich_exc)
         try:
             sent_card = fallback_card
-            sent = await context.bot.send_message(
-                chat_id=message.chat_id,
-                business_connection_id=connection_id,
-                text=fallback_card,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
+            send_kwargs["text"] = fallback_card
+            send_kwargs["parse_mode"] = ParseMode.HTML
+            sent = await context.bot.send_message(**send_kwargs)
         except TelegramError as fallback_exc:
             logger.exception("Could not send NFT card even without custom emoji: %s", fallback_exc)
             # Don't mislabel every API error as a permission problem. Log the
             # technical cause and keep the customer-facing message neutral.
             try:
-                await context.bot.send_message(
-                    chat_id=message.chat_id,
-                    business_connection_id=connection_id,
-                    text="Не получилось отправить карточку предложения. Попробуйте ещё раз позже.",
-                )
+                failure_kwargs: dict[str, Any] = {
+                    "chat_id": message.chat_id,
+                    "text": "Не получилось отправить карточку предложения. Команда оставлена в чате — попробуйте ещё раз.",
+                }
+                if connection_id:
+                    failure_kwargs["business_connection_id"] = connection_id
+                await context.bot.send_message(**failure_kwargs)
             except TelegramError:
                 logger.exception("Could not send NFT card failure notice")
-            return
+            return False
 
     if sent is not None:
         key = f"{sent.chat_id}:{sent.message_id}"
@@ -732,6 +777,8 @@ async def handle_nft_command(
             "is_telegram_nft": is_telegram_nft,
         }
         logger.info("NFT offer card sent: chat_id=%s message_id=%s buyer_id=%s", sent.chat_id, sent.message_id, buyer_id)
+        return True
+    return False
 
 
 async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -754,11 +801,13 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
         logger.warning("Ignoring Business message because connection is disabled: %s", connection_id)
         return
     if connection_info and connection_info.get("can_reply") is False:
+        # Do not silently discard the command. We still attempt the send below; if
+        # Telegram rejects it, the command remains visible and the exact API error
+        # is written to Render logs.
         logger.warning(
-            "Business message received but the connection has no reply permission: connection_id=%s",
+            "Business message received while can_reply is false; attempting card send anyway: connection_id=%s",
             connection_id,
         )
-        return
 
     sender = message.from_user
     is_owner_message = bool(sender and connection_info and sender.id == connection_info.get("user_id"))
@@ -770,29 +819,41 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
     # The BUYER sends `.nft <price> <gift link>` in the private chat with
     # the connected Business account. The seller is the Business account owner.
     if not is_owner_message and parsed_nft:
-        if not sender or not connection_info or not connection_info.get("user_id"):
-            logger.warning("Cannot process buyer NFT command: missing buyer or Business owner info")
+        if not sender:
+            logger.warning("Cannot process buyer NFT command: Business message has no sender user")
             return
 
         buyer_id = int(sender.id)
-        seller_id = int(connection_info["user_id"])
+        # Prefer the live Business connection owner; if Telegram does not return
+        # connection metadata after a restart, use the optional configured seller ID.
+        # Zero keeps the offer card renderable instead of silently dropping it.
+        owner_value = connection_info.get("user_id") if connection_info else None
+        if not owner_value:
+            owner_value = os.getenv("SELLER_TELEGRAM_ID", "").strip()
+        try:
+            seller_id = int(owner_value) if owner_value else 0
+        except (TypeError, ValueError):
+            logger.warning("SELLER_TELEGRAM_ID is invalid; offer will use preview button permissions")
+            seller_id = 0
         buyer_username = getattr(sender, "username", None)
         buyer_first_name = getattr(sender, "first_name", None)
         buyer_name = f"@{buyer_username}" if buyer_username else (buyer_first_name or f"Покупатель {buyer_id}")
 
-        # Try to remove the buyer's raw command before replacing it with the offer card.
-        try:
-            await context.bot.delete_business_messages(
-                business_connection_id=connection_id,
-                message_ids=[message.message_id],
-            )
-        except (AttributeError, TelegramError) as exc:
-            logger.warning("Could not delete buyer's .nft command in Business chat: %s", exc)
-
-        await handle_nft_command(
+        # Send the card first. Never remove the buyer's command unless the card
+        # was successfully created; otherwise a temporary API/permission problem
+        # would leave the chat with neither the command nor a card.
+        sent_ok = await handle_nft_command(
             message, context, connection_id, *parsed_nft,
             seller_id, buyer_id, buyer_name,
         )
+        if sent_ok:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=connection_id,
+                    message_ids=[message.message_id],
+                )
+            except (AttributeError, TelegramError) as exc:
+                logger.warning("Could not delete buyer's .nft command in Business chat: %s", exc)
         return
 
     # Don't answer the owner's outgoing messages, and don't send an away reply
@@ -883,6 +944,9 @@ async def lifespan(fastapi_app: FastAPI):
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
     telegram_app.add_handler(MessageHandler(filters.Sticker.ALL, show_sticker_file_id))
     telegram_app.add_handler(CallbackQueryHandler(button_router))
+    # `.nft` is not a Telegram slash-command, so it needs a text handler in the
+    # bot's own private chat. Business-chat commands are handled above.
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, direct_nft_command))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_offer))
 
     await telegram_app.initialize()
@@ -930,6 +994,8 @@ async def telegram_webhook(request: Request):
     tg_app: Application = request.app.state.telegram_app
     try:
         payload = await request.json()
+        update_keys = [key for key, value in payload.items() if value is not None]
+        logger.info("Webhook update received: update_id=%s keys=%s", payload.get("update_id"), update_keys)
         update = Update.de_json(payload, tg_app.bot)
         await tg_app.process_update(update)
     except Exception as exc:
