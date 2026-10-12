@@ -11,11 +11,11 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
+    BusinessConnectionHandler,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    TypeHandler,
     filters,
 )
 
@@ -85,6 +85,10 @@ async def safe_edit_text(query: Any, text: str, **kwargs: Any) -> bool:
     """Edit the existing bot message in place; never delete/repost for menu navigation."""
     if query.message is None:
         return False
+    # Business messages must be edited in the context of their connection.
+    business_connection_id = getattr(query.message, "business_connection_id", None)
+    if business_connection_id and "business_connection_id" not in kwargs:
+        kwargs["business_connection_id"] = business_connection_id
     try:
         await query.edit_message_text(text=text, **kwargs)
         return True
@@ -131,7 +135,17 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data = query.data
 
     if data == "create_offer":
-        context.user_data["awaiting_offer"] = True
+        is_business_message = bool(
+            query.message is not None
+            and getattr(query.message, "business_connection_id", None)
+        )
+        if is_business_message:
+            context.user_data.pop("awaiting_offer", None)
+            context.user_data["awaiting_business_offer"] = True
+            context.user_data["business_connection_id"] = query.message.business_connection_id
+        else:
+            context.user_data.pop("awaiting_business_offer", None)
+            context.user_data["awaiting_offer"] = True
         if query.message is not None:
             context.user_data["flow_chat_id"] = query.message.chat_id
             context.user_data["flow_message_id"] = query.message.message_id
@@ -149,18 +163,32 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not edited:
             # Fallback only if Telegram does not permit editing the current message.
             if query.message is not None:
-                sent = await query.message.reply_text(
+                fallback_text = (
                     "Отправьте одним сообщением описание предложения. Для отмены используйте /cancel."
-                    + warning_footer(),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=cancel_keyboard(),
+                    + warning_footer()
                 )
+                if is_business_message:
+                    sent = await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        business_connection_id=query.message.business_connection_id,
+                        text=fallback_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=cancel_keyboard(),
+                    )
+                else:
+                    sent = await query.message.reply_text(
+                        fallback_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=cancel_keyboard(),
+                    )
                 context.user_data["flow_chat_id"] = sent.chat_id
                 context.user_data["flow_message_id"] = sent.message_id
         return
 
     if data == "main_menu":
         context.user_data.pop("awaiting_offer", None)
+        context.user_data.pop("awaiting_business_offer", None)
+        context.user_data.pop("business_connection_id", None)
         context.user_data.pop("flow_chat_id", None)
         context.user_data.pop("flow_message_id", None)
         await query.answer()
@@ -200,6 +228,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if data == "cancel_offer":
         context.user_data.pop("awaiting_offer", None)
+        context.user_data.pop("awaiting_business_offer", None)
+        context.user_data.pop("business_connection_id", None)
         context.user_data.pop("flow_chat_id", None)
         context.user_data.pop("flow_message_id", None)
         await query.answer("Создание предложения отменено.")
@@ -368,59 +398,240 @@ async def receive_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def business_connection_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Track Telegram Business connections and their enabled/disabled state."""
+    """Remember connection details and log whether Telegram permits replies."""
     connection = update.business_connection
     if connection is None:
         return
+
+    rights = getattr(connection, "rights", None)
+    can_reply = getattr(rights, "can_reply", None) if rights is not None else None
+    connections: dict[str, dict[str, Any]] = context.bot_data.setdefault("business_connections", {})
+    connections[connection.id] = {
+        "user_id": connection.user.id,
+        "user_name": connection.user.full_name,
+        "is_enabled": connection.is_enabled,
+        "can_reply": can_reply,
+    }
     logger.info(
-        "Business connection update: id=%s enabled=%s user_id=%s",
+        "Business connection update received: id=%s enabled=%s owner_id=%s can_reply=%s",
         connection.id,
         connection.is_enabled,
         connection.user.id,
+        can_reply,
     )
 
 
+async def _get_business_connection_info(
+    connection_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> dict[str, Any] | None:
+    """Use cached connection data; refresh it from Telegram when not cached."""
+    connections: dict[str, dict[str, Any]] = context.bot_data.setdefault("business_connections", {})
+    info = connections.get(connection_id)
+    if info is not None:
+        return info
+    try:
+        connection = await context.bot.get_business_connection(connection_id)
+        rights = getattr(connection, "rights", None)
+        info = {
+            "user_id": connection.user.id,
+            "user_name": connection.user.full_name,
+            "is_enabled": connection.is_enabled,
+            "can_reply": getattr(rights, "can_reply", None) if rights is not None else None,
+        }
+        connections[connection_id] = info
+        logger.info(
+            "Business connection details refreshed: id=%s enabled=%s can_reply=%s",
+            connection_id,
+            info["is_enabled"],
+            info["can_reply"],
+        )
+        return info
+    except (AttributeError, TelegramError) as exc:
+        logger.warning("Could not refresh Business connection %s: %s", connection_id, exc)
+        return None
+
+
+async def _finish_business_offer(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, connection_id: str
+) -> None:
+    """Create the offer card as a message sent on behalf of the connected Business account."""
+    description = (message.text or "").strip()
+    if description.lower() == "/cancel":
+        context.user_data.pop("awaiting_business_offer", None)
+        context.user_data.pop("business_connection_id", None)
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text="Создание предложения отменено.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if len(description) > MAX_OFFER_LENGTH:
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text=f"Слишком длинный текст. Максимум — {MAX_OFFER_LENGTH} символов. Сократите описание и отправьте снова.",
+        )
+        return
+
+    connection_info = await _get_business_connection_info(connection_id, context)
+    owner_id = int(connection_info["user_id"]) if connection_info and connection_info.get("user_id") else 0
+    owner_name = html.escape(str(connection_info.get("user_name") or "Бизнес-аккаунт")) if connection_info else "Бизнес-аккаунт"
+    card = (
+        f"<b>{custom_emoji(EMOJI_OFFER, '📨')} Предложение</b>\n\n"
+        f"<b>Описание:</b>\n{html.escape(description)}\n\n"
+        f"<b>Отправитель:</b> {owner_name}\n"
+        f"{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Подтверждение:</b> ожидается\n"
+        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Безопасная сделка:</b> проверяйте условия самостоятельно\n"
+        f"{custom_emoji(EMOJI_STARS, '⭐')} <b>Рейтинг:</b> не указан"
+        + warning_footer()
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Подтвердить условия", callback_data=f"confirm:{owner_id}"),
+                InlineKeyboardButton("Отклонить", callback_data=f"reject:{owner_id}"),
+            ],
+            [InlineKeyboardButton("Безопасная сделка — информация", callback_data=f"safe:{owner_id}")],
+        ]
+    )
+    try:
+        sent_card = await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text=card,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        logger.exception("Could not send Business offer card: %s", exc)
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text="Не получилось отправить карточку. Проверьте в настройках Telegram Business право бота отвечать на сообщения.",
+        )
+        return
+
+    key = f"{sent_card.chat_id}:{sent_card.message_id}"
+    cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
+    cards[key] = card
+    context.user_data.pop("awaiting_business_offer", None)
+    context.user_data.pop("business_connection_id", None)
+
+    # Update the existing prompt in-place where Telegram allows it.
+    flow_chat_id = context.user_data.pop("flow_chat_id", None)
+    flow_message_id = context.user_data.pop("flow_message_id", None)
+    if flow_chat_id and flow_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=flow_chat_id,
+                message_id=flow_message_id,
+                business_connection_id=connection_id,
+                text="Предложение создано. Карточка отправлена выше.\n\n" + warning_footer(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            logger.info("Could not update Business prompt in place: %s", exc)
+
+
 async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply in connected Telegram Business chats on behalf of the connected account."""
+    """Process normal text in Telegram Business chats and reply on behalf of the account."""
     message = update.business_message
     if message is None or not message.business_connection_id or not message.text:
         return
-    if message.sender_business_bot:
-        return
 
+    connection_id = message.business_connection_id
     text = message.text.strip()
-    # Avoid replying to every message with a repetitive greeting. Only respond to
-    # explicit start/help commands or messages that ask what the business assistant does.
-    lowered = text.lower()
-    if lowered.startswith("/start") or lowered.startswith("/help"):
-        response = (
-            "Здравствуйте! Это бизнес-ассистент NEZZX.\n\n"
-            "Я могу помочь оформить текст предложения. Напишите «создать предложение», "
-            "чтобы получить инструкцию.\n\n"
-            "Важно: бот не принимает и не хранит деньги, не подтверждает оплату и не является "
-            "официальным сервисом защиты Telegram. Проверяйте условия и платежи самостоятельно."
+    logger.info(
+        "Incoming Business text update: connection_id=%s chat_id=%s text_length=%s",
+        connection_id,
+        message.chat_id,
+        len(text),
+    )
+
+    connection_info = await _get_business_connection_info(connection_id, context)
+    if connection_info and not connection_info.get("is_enabled", True):
+        logger.warning("Ignoring Business message because connection is disabled: %s", connection_id)
+        return
+    if connection_info and connection_info.get("can_reply") is False:
+        logger.warning(
+            "Business message received but the connection has no reply permission: connection_id=%s",
+            connection_id,
         )
-    elif "создать предложение" in lowered or lowered == "предложение":
-        response = (
-            "Чтобы подготовить текст предложения, отправьте описание условий одним сообщением. "
-            "Не указывайте пароли, коды подтверждения или данные банковских карт.\n\n"
-            "Бот только оформляет текст и не гарантирует исполнение сделки или оплату."
-        )
-    else:
         return
 
+    sender = message.from_user
+    if sender and connection_info and sender.id == connection_info.get("user_id"):
+        # The connected account owner sent this message; do not auto-reply to the owner.
+        return
+    if getattr(message, "sender_business_bot", False):
+        return
+
+    lowered = text.lower()
+    if context.user_data.get("awaiting_business_offer"):
+        await _finish_business_offer(message, context, connection_id)
+        return
+
+    if lowered in {"/cancel", "отмена"}:
+        context.user_data.pop("awaiting_business_offer", None)
+        context.user_data.pop("business_connection_id", None)
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text="Сейчас нет активного создания предложения.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if "создать предложение" in lowered or lowered == "предложение":
+        context.user_data["awaiting_business_offer"] = True
+        context.user_data["business_connection_id"] = connection_id
+        prompt = await context.bot.send_message(
+            chat_id=message.chat_id,
+            business_connection_id=connection_id,
+            text=(
+                "<b>Создание предложения</b>\n\n"
+                "Отправьте одним сообщением описание предложения и условия.\n"
+                "Не указывайте пароли, коды подтверждения или полные данные банковских карт."
+                + warning_footer()
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_keyboard(),
+        )
+        context.user_data["flow_chat_id"] = prompt.chat_id
+        context.user_data["flow_message_id"] = prompt.message_id
+        return
+
+    # Business chats now get a visible response to ordinary incoming text as well,
+    # not only to /start or a special phrase.
+    response = (
+        "<b>NEZZX — предложения и сделки</b>\n\n"
+        "Здравствуйте! Я помогу оформить карточку предложения. Выберите действие ниже "
+        "или напишите «создать предложение».\n\n"
+        "Бот не принимает и не хранит деньги и не подтверждает оплату."
+        + warning_footer()
+    )
     try:
         await context.bot.send_message(
             chat_id=message.chat_id,
+            business_connection_id=connection_id,
             text=response,
-            business_connection_id=message.business_connection_id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True,
         )
     except TelegramError as exc:
-        logger.warning("Could not reply in Telegram Business chat: %s", exc)
+        logger.exception("Could not reply in Telegram Business chat: %s", exc)
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_offer", None)
+    context.user_data.pop("awaiting_business_offer", None)
+    context.user_data.pop("business_connection_id", None)
     context.user_data.pop("flow_chat_id", None)
     context.user_data.pop("flow_message_id", None)
     message = update.effective_message
@@ -442,8 +653,12 @@ async def lifespan(fastapi_app: FastAPI):
         raise RuntimeError("RENDER_EXTERNAL_URL was not found. Set WEBHOOK_URL to your Render HTTPS service URL.")
 
     telegram_app = Application.builder().token(token).build()
-    telegram_app.add_handler(TypeHandler(Update, business_connection_update), group=1)
-    telegram_app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, business_message_reply))
+    # Use dedicated Business handlers. A catch-all TypeHandler(Update) is too broad
+    # and makes it harder to reason about handler priority in this application.
+    telegram_app.add_handler(BusinessConnectionHandler(business_connection_update))
+    telegram_app.add_handler(
+        MessageHandler(filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, business_message_reply)
+    )
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
@@ -457,7 +672,8 @@ async def lifespan(fastapi_app: FastAPI):
         url=webhook_url,
         secret_token=secret,
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        # Do not silently discard Business messages waiting during a Render restart/sleep.
+        drop_pending_updates=False,
     )
     fastapi_app.state.webhook_secret = secret
     fastapi_app.state.telegram_app = telegram_app
@@ -465,7 +681,8 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+        # Keep the webhook registered across Render restarts. Deleting it during every
+        # shutdown creates a delivery gap and can make Business chats appear unresponsive.
         await telegram_app.stop()
         await telegram_app.shutdown()
 
