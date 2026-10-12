@@ -15,6 +15,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -366,6 +367,58 @@ async def receive_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.info("Could not update flow message in place: %s", exc)
 
 
+async def business_connection_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Track Telegram Business connections and their enabled/disabled state."""
+    connection = update.business_connection
+    if connection is None:
+        return
+    logger.info(
+        "Business connection update: id=%s enabled=%s user_id=%s",
+        connection.id,
+        connection.is_enabled,
+        connection.user.id,
+    )
+
+
+async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply in connected Telegram Business chats on behalf of the connected account."""
+    message = update.business_message
+    if message is None or not message.business_connection_id or not message.text:
+        return
+    if message.sender_business_bot:
+        return
+
+    text = message.text.strip()
+    # Avoid replying to every message with a repetitive greeting. Only respond to
+    # explicit start/help commands or messages that ask what the business assistant does.
+    lowered = text.lower()
+    if lowered.startswith("/start") or lowered.startswith("/help"):
+        response = (
+            "Здравствуйте! Это бизнес-ассистент NEZZX.\n\n"
+            "Я могу помочь оформить текст предложения. Напишите «создать предложение», "
+            "чтобы получить инструкцию.\n\n"
+            "Важно: бот не принимает и не хранит деньги, не подтверждает оплату и не является "
+            "официальным сервисом защиты Telegram. Проверяйте условия и платежи самостоятельно."
+        )
+    elif "создать предложение" in lowered or lowered == "предложение":
+        response = (
+            "Чтобы подготовить текст предложения, отправьте описание условий одним сообщением. "
+            "Не указывайте пароли, коды подтверждения или данные банковских карт.\n\n"
+            "Бот только оформляет текст и не гарантирует исполнение сделки или оплату."
+        )
+    else:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            text=response,
+            business_connection_id=message.business_connection_id,
+        )
+    except TelegramError as exc:
+        logger.warning("Could not reply in Telegram Business chat: %s", exc)
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_offer", None)
     context.user_data.pop("flow_chat_id", None)
@@ -389,6 +442,8 @@ async def lifespan(fastapi_app: FastAPI):
         raise RuntimeError("RENDER_EXTERNAL_URL was not found. Set WEBHOOK_URL to your Render HTTPS service URL.")
 
     telegram_app = Application.builder().token(token).build()
+    telegram_app.add_handler(TypeHandler(Update, business_connection_update, filters=filters.UpdateType.BUSINESS_CONNECTION))
+    telegram_app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, business_message_reply))
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
