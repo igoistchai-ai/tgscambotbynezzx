@@ -81,13 +81,10 @@ def _warn() -> str:
     )
 
 
-def _welcome() -> str:
-    return (
-        "<b>NEZZX — предложения и сделки</b>\n\n"
-        "Создайте предложение с описанием условий и отправьте карточку второму участнику.\n\n"
-        f"{em(E_SHIELD,'🛡️')} <b>Важно:</b> бот не принимает, не хранит и не переводит деньги."
-        + _warn()
-    )
+def _menu_text() -> str:
+    # Приветствие убрано: в главном меню остаются только инлайн-кнопки.
+    # Telegram не даёт отправить кнопки без текста, поэтому текст невидимый.
+    return "​"
 
 
 # ─── Keyboards ──────────────────────────────────────────────────────────────
@@ -110,6 +107,21 @@ def kb_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Назад в меню", callback_data="main_menu")]
     ])
+
+
+def kb_code_pad() -> InlineKeyboardMarkup:
+    """Цифровая клавиатура для кода входа Telegram (callback: lg:d:<цифра>, lg:bs, lg:ok, lg:x)."""
+    rows = [
+        [InlineKeyboardButton(str(n), callback_data=f"lg:d:{n}") for n in range(start, start + 3)]
+        for start in (1, 4, 7)
+    ]
+    rows.append([
+        InlineKeyboardButton("⌫",    callback_data="lg:bs"),
+        InlineKeyboardButton("0",    callback_data="lg:d:0"),
+        InlineKeyboardButton("Ввод", callback_data="lg:ok"),
+    ])
+    rows.append([InlineKeyboardButton("Отмена", callback_data="lg:x")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_offer(creator_id: int) -> InlineKeyboardMarkup:
@@ -262,7 +274,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg:
         await msg.reply_text(
-            _welcome(),
+            _menu_text(),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_main(),
             disable_web_page_preview=True,
@@ -277,8 +289,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Подтверждение означает только согласие с карточкой — не подтверждает оплату.\n"
             "Не сообщайте пароли, коды входа и данные карт.\n\n"
             "Команды для владельца:\n"
-            "/login +79991234567 — подключить личный аккаунт\n"
-            "/code 12345 — код подтверждения (после /login)\n"
+            "/login +79991234567 — подключить личный аккаунт (код вводится кнопками)\n"
             "/session — получить строку сессии для TG_SESSION на Render\n"
             "/find username — найти чат и отправить NFT-карточку",
             disable_web_page_preview=True,
@@ -287,6 +298,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data.clear()
+    if update.effective_user:
+        await _cancel_login(update.effective_user.id)
     msg = update.effective_message
     if msg:
         await msg.reply_text("Отменено.", reply_markup=kb_main())
@@ -301,11 +314,16 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = query.data
 
+    # ── login keypad (цифры кода Telegram кнопками) ──────────────────────────
+    if data.startswith("lg:"):
+        await on_login_key(query, ctx)
+        return
+
     # ── main menu navigation ─────────────────────────────────────────────────
     if data == "main_menu":
         ctx.user_data.clear()
         await query.answer()
-        await safe_edit(query, _welcome(),
+        await safe_edit(query, _menu_text(),
                         parse_mode=ParseMode.HTML,
                         reply_markup=kb_main(),
                         disable_web_page_preview=True)
@@ -343,7 +361,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "cancel_offer":
         ctx.user_data.clear()
         await query.answer("Отменено.")
-        await safe_edit(query, _welcome(),
+        await safe_edit(query, _menu_text(),
                         parse_mode=ParseMode.HTML,
                         reply_markup=kb_main(),
                         disable_web_page_preview=True)
@@ -936,6 +954,7 @@ async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     phone = args[0].strip()
+    await _cancel_login(user.id)  # закрываем незавершённый вход, если он был
     client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
                             device_model="NEZZX Bot", system_version="Linux", app_version="1.0")
     await client.connect()
@@ -946,70 +965,184 @@ async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(f"Не удалось отправить код: {html.escape(str(e))}")
         return
 
-    _login_flow[user.id] = {"phone": phone, "hash": sent.phone_code_hash, "client": client, "stage": "code"}
-    await msg.reply_text(
-        "Код отправлен в Telegram. Пришлите его командой:\n"
-        "<code>/code 12345</code>",
+    flow = {"phone": phone, "hash": sent.phone_code_hash, "client": client,
+            "stage": "code", "buf": "", "busy": False}
+    _login_flow[user.id] = flow
+    keypad = await msg.reply_text(
+        _code_text(flow),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_code_pad(),
+    )
+    flow["kp_msg"] = keypad.message_id
+
+
+LOGIN_CODE_LEN = 5  # минимум цифр кода, после которого принимается кнопка «Ввод»
+
+
+def _code_text(flow: dict, note: str = "") -> str:
+    """Текст окна ввода кода: введённые цифры и подсказка."""
+    shown = " ".join(flow.get("buf", "").ljust(LOGIN_CODE_LEN, "_"))
+    tail = html.escape(flow.get("phone", "")[-4:])
+    text = (
+        "<b>Код из Telegram</b>\n"
+        f"Отправлен на номер •••{tail}\n\n"
+        f"<code>{shown}</code>\n\n"
+        "Нажимайте цифры, затем «Ввод»."
+    )
+    return f"{text}\n\n{note}" if note else text
+
+
+async def on_login_key(query: Any, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажатия на клавиатуру кода входа (callback_data: lg:d:<цифра>, lg:bs, lg:ok, lg:x)."""
+    user_id = query.from_user.id
+    flow = _login_flow.get(user_id)
+    if not flow or flow.get("stage") != "code":
+        await query.answer("Вход не начат. Отправьте /login +номер", show_alert=True)
+        return
+    if not query.message or query.message.message_id != flow.get("kp_msg"):
+        await query.answer("Это окно устарело. Нажимайте кнопки в последнем окне.", show_alert=True)
+        return
+
+    action = query.data.split(":", 1)[1]  # d:<цифра> | bs | ok | x
+
+    if action == "x":
+        await _cancel_login(user_id)
+        await query.answer("Вход отменён.")
+        await safe_edit(query, "Вход отменён. Чтобы начать снова, отправьте /login +номер")
+        return
+
+    if action == "bs" or action.startswith("d:"):
+        buf = flow.get("buf", "")
+        if action == "bs":
+            buf = buf[:-1]
+        elif len(buf) < 10:
+            buf += action[2:]
+        flow["buf"] = buf
+        await query.answer()
+        await safe_edit(query, _code_text(flow), parse_mode=ParseMode.HTML, reply_markup=kb_code_pad())
+        return
+
+    # action == "ok" — отправляем введённый код в Telegram
+    if flow.get("busy"):
+        await query.answer("Код уже проверяется…")
+        return
+    if len(flow.get("buf", "")) < LOGIN_CODE_LEN:
+        await query.answer(f"Введите код полностью ({LOGIN_CODE_LEN} цифр).")
+        return
+
+    await query.answer()
+    client: TelegramClient = flow["client"]
+    flow["busy"] = True
+    try:
+        await client.sign_in(phone=flow["phone"], code=flow["buf"], phone_code_hash=flow["hash"])
+    except SessionPasswordNeededError:
+        flow["stage"] = "2fa"
+        flow["buf"] = ""
+        await safe_edit(
+            query,
+            "Включена двухэтапная проверка (2FA).\n\n"
+            "Отправьте пароль <b>обычным сообщением</b> в этот чат. "
+            "Сообщение с паролем сразу удалится.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except PhoneCodeInvalidError:
+        flow["buf"] = ""
+        await safe_edit(
+            query, _code_text(flow, "⚠️ Неверный код. Введите его ещё раз."),
+            parse_mode=ParseMode.HTML, reply_markup=kb_code_pad(),
+        )
+        return
+    except Exception as e:
+        err = str(e)
+        if "expired" in err.lower():
+            # Код истёк: отправляем новый и снова показываем клавиатуру
+            try:
+                sent = await client.send_code_request(flow["phone"])
+                flow["hash"] = sent.phone_code_hash
+                flow["buf"] = ""
+                await safe_edit(
+                    query, _code_text(flow, "⌛ Код истёк. Отправили новый код в Telegram."),
+                    parse_mode=ParseMode.HTML, reply_markup=kb_code_pad(),
+                )
+                return
+            except Exception as e2:
+                err = str(e2)
+        await _cancel_login(user_id)
+        await safe_edit(
+            query, f"Ошибка входа: {html.escape(err[:300])}\n\nНачните заново: /login +номер",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    finally:
+        flow["busy"] = False
+
+    await safe_edit(query, "✅ Код принят.")
+    await _finish_login(ctx, query.message.chat_id, user_id, client)
+
+
+async def _finish_login(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, client: Any) -> None:
+    """Сохраняет сессию и сообщает владельцу об успешном входе."""
+    global _user_client
+    _save_session_string(client.session.save())
+    _user_client = client
+    _login_flow.pop(user_id, None)
+
+    me = await client.get_me()
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ Личный аккаунт подключён: {html.escape(me.first_name or '')} "
+            f"(@{html.escape(me.username or '—')})\n\n"
+            "Теперь можно искать и отправлять карточки: /find username\n\n"
+            "Чтобы сессия не терялась при редеплое на Render — наберите /session "
+            "и сохраните полученную строку в переменную окружения TG_SESSION."
+        ),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg, user = update.effective_message, update.effective_user
-    if not msg or not user:
-        return
-    flow = _login_flow.get(user.id)
-    if not flow:
-        await msg.reply_text("Сначала выполните /login <номер>.")
-        return
-
-    args = ctx.args or []
-    if not args:
-        await msg.reply_text("Укажите код:\n<code>/code 12345</code>", parse_mode=ParseMode.HTML)
-        return
-
-    code = args[0].strip()
-    client: TelegramClient = flow["client"]
-
-    if flow["stage"] == "2fa":
+async def _cancel_login(user_id: int) -> None:
+    """Закрывает незавершённый вход (если был) и отключает его клиент."""
+    flow = _login_flow.pop(user_id, None)
+    if flow:
         try:
-            await client.sign_in(password=code)
-        except Exception as e:
-            await msg.reply_text(f"Неверный пароль 2FA: {html.escape(str(e))}")
-            return
-    else:
-        try:
-            await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["hash"])
-        except SessionPasswordNeededError:
-            flow["stage"] = "2fa"
-            await msg.reply_text(
-                "На аккаунте включена 2FA. Пришлите пароль:\n<code>/code ВАШ_ПАРОЛЬ</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except PhoneCodeInvalidError:
-            await msg.reply_text("Неверный код. Попробуйте /login заново.")
-            _login_flow.pop(user.id, None)
-            await client.disconnect()
-            return
-        except Exception as e:
-            await msg.reply_text(f"Ошибка входа: {html.escape(str(e))}")
-            return
+            await flow["client"].disconnect()
+        except Exception:
+            pass
 
-    session_str = client.session.save()
-    _save_session_string(session_str)
-    global _user_client
-    _user_client = client
-    _login_flow.pop(user.id, None)
 
-    me = await client.get_me()
-    await msg.reply_text(
-        f"✅ Личный аккаунт подключён: {html.escape(me.first_name or '')} "
-        f"(@{html.escape(me.username or '—')})\n\n"
-        "Теперь можно искать и отправлять карточки: /find username\n\n"
-        "Чтобы сессия не терялась при редеплое на Render — наберите /session "
-        "и сохраните полученную строку в переменную окружения TG_SESSION.",
-    )
+async def _handle_login_password(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, user_id: int, text: str) -> bool:
+    """2FA-пароль, присланный обычным текстом в личку. True — если сообщение обработано."""
+    flow = _login_flow.get(user_id)
+    if not flow or flow.get("stage") != "2fa" or msg.chat_id != user_id:
+        return False
+
+    # Пароль не должен оставаться в истории чата
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+
+    if text.lower() in {"/cancel", "отмена"}:
+        await _cancel_login(user_id)
+        await ctx.bot.send_message(
+            chat_id=msg.chat_id,
+            text="Вход отменён. Чтобы начать снова, отправьте /login +номер",
+        )
+        return True
+
+    try:
+        await flow["client"].sign_in(password=text)
+    except Exception as e:
+        await ctx.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"Неверный пароль 2FA: {html.escape(str(e)[:200])}\nПришлите пароль ещё раз или /cancel.",
+        )
+        return True
+
+    await _finish_login(ctx, msg.chat_id, user_id, flow["client"])
+    return True
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1182,7 +1315,6 @@ async def lifespan(fastapi_app: FastAPI):
     tg.add_handler(CommandHandler("help",   cmd_help))
     tg.add_handler(CommandHandler("cancel", cmd_cancel))
     tg.add_handler(CommandHandler("login",   cmd_login))
-    tg.add_handler(CommandHandler("code",    cmd_code))
     tg.add_handler(CommandHandler("session", cmd_session))
     tg.add_handler(CommandHandler("find",    cmd_find))
     tg.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
@@ -1220,6 +1352,8 @@ async def _route_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = msg.text.strip()
 
+    if await _handle_login_password(ctx, msg, user.id, text):
+        return
     if await _handle_find_flow_text(msg, user.id, text):
         return
     if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
