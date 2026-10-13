@@ -5,23 +5,24 @@ env vars:
   WEBHOOK_SECRET       required, >= 8 chars
   WEBHOOK_URL          required, https://...
   PREMIUM_STICKER_FILE_ID  optional
+  TG_API_ID            required for /find + NFT search (my.telegram.org)
+  TG_API_HASH          required for /find + NFT search
+  TG_SESSION            optional: a ready Telethon StringSession —
+                        skips /login entirely if set
+  TG_SESSION_PATH       optional: file path to persist the session string
+                        after /login so it survives restarts (default: /tmp/tg.session.txt)
 """
 
 import html
-import io
 import logging
 import os
 import re
-import secrets
-import sqlite3
-import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from fastapi import BackgroundTasks, Cookie, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -34,6 +35,14 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+    _TELETHON_OK = True
+except ImportError:
+    _TELETHON_OK = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -266,7 +275,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(
             "Нажмите «Создать предложение» и отправьте текст с условиями.\n\n"
             "Подтверждение означает только согласие с карточкой — не подтверждает оплату.\n"
-            "Не сообщайте пароли, коды входа и данные карт.",
+            "Не сообщайте пароли, коды входа и данные карт.\n\n"
+            "Команды для владельца:\n"
+            "/login +79991234567 — подключить личный аккаунт\n"
+            "/code 12345 — код подтверждения (после /login)\n"
+            "/session — получить строку сессии для TG_SESSION на Render\n"
+            "/find username — найти чат и отправить NFT-карточку",
             disable_web_page_preview=True,
         )
 
@@ -828,6 +842,321 @@ async def on_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("PREMIUM_STICKER_FILE_ID для Render:\n" + msg.sticker.file_id)
 
 
+# ─── Personal-account client (Telethon) ──────────────────────────────────────
+#
+# The Bot API bot above can only message chats that already exist AND only
+# after the other side has written first. To find @username and send a card
+# into an existing personal chat, we need the owner's real account (MTProto).
+# No website: login happens entirely through bot commands in the bot's own
+# DM with the owner.
+
+TG_API_ID       = int(os.getenv("TG_API_ID", "0") or "0")
+TG_API_HASH     = os.getenv("TG_API_HASH", "").strip()
+TG_SESSION_PATH = os.getenv("TG_SESSION_PATH", "/tmp/tg.session.txt")
+
+_user_client: "TelegramClient | None" = None          # live Telethon client, once logged in
+_login_flow: dict[int, dict] = {}                      # owner_tg_id -> {"phone":.., "hash":.., "client":..}
+
+
+def _load_session_string() -> str:
+    env_val = os.getenv("TG_SESSION", "").strip()
+    if env_val:
+        return env_val
+    try:
+        if os.path.exists(TG_SESSION_PATH):
+            return open(TG_SESSION_PATH, "r", encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _save_session_string(value: str) -> None:
+    try:
+        with open(TG_SESSION_PATH, "w", encoding="utf-8") as f:
+            f.write(value)
+    except OSError as e:
+        log.warning("Could not persist TG session to %s: %s", TG_SESSION_PATH, e)
+
+
+async def _get_user_client() -> "TelegramClient":
+    """Return a connected, authorized Telethon client, or raise RuntimeError."""
+    global _user_client
+    if not _TELETHON_OK:
+        raise RuntimeError("Модуль telethon не установлен. Добавьте telethon в requirements.txt")
+    if not TG_API_ID or not TG_API_HASH:
+        raise RuntimeError("Задайте TG_API_ID и TG_API_HASH в переменных окружения (my.telegram.org)")
+
+    if _user_client is not None and _user_client.is_connected():
+        return _user_client
+
+    session_str = _load_session_string()
+    if not session_str:
+        raise RuntimeError("Личный аккаунт не подключён. Используйте /login <номер>")
+
+    client = TelegramClient(StringSession(session_str), TG_API_ID, TG_API_HASH,
+                            device_model="NEZZX Bot", system_version="Linux", app_version="1.0")
+    await client.connect()
+    if not await client.is_user_authorized():
+        _user_client = None
+        raise RuntimeError("Сессия истекла. Используйте /login <номер> заново")
+    _user_client = client
+    return client
+
+
+# ─── /login flow (owner-only, driven entirely by bot commands) ──────────────
+
+def _is_bot_owner(user_id: int) -> bool:
+    raw = os.getenv("OWNER_TG_ID", "").strip()
+    if not raw:
+        return True  # no restriction configured — allow whoever runs the bot
+    allowed = {int(x) for x in re.split(r"[,\s]+", raw) if x.strip().isdigit()}
+    return user_id in allowed
+
+
+async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    if not _is_bot_owner(user.id):
+        await msg.reply_text("Эта команда доступна только владельцу бота.")
+        return
+    if not _TELETHON_OK:
+        await msg.reply_text("Модуль telethon не установлен на сервере.")
+        return
+    if not TG_API_ID or not TG_API_HASH:
+        await msg.reply_text("Сначала задайте TG_API_ID и TG_API_HASH в переменных окружения (my.telegram.org).")
+        return
+
+    args = ctx.args or []
+    if not args:
+        await msg.reply_text(
+            "Укажите номер телефона:\n<code>/login +79991234567</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    phone = args[0].strip()
+    client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
+                            device_model="NEZZX Bot", system_version="Linux", app_version="1.0")
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+    except Exception as e:
+        await client.disconnect()
+        await msg.reply_text(f"Не удалось отправить код: {html.escape(str(e))}")
+        return
+
+    _login_flow[user.id] = {"phone": phone, "hash": sent.phone_code_hash, "client": client, "stage": "code"}
+    await msg.reply_text(
+        "Код отправлен в Telegram. Пришлите его командой:\n"
+        "<code>/code 12345</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    flow = _login_flow.get(user.id)
+    if not flow:
+        await msg.reply_text("Сначала выполните /login <номер>.")
+        return
+
+    args = ctx.args or []
+    if not args:
+        await msg.reply_text("Укажите код:\n<code>/code 12345</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code = args[0].strip()
+    client: TelegramClient = flow["client"]
+
+    if flow["stage"] == "2fa":
+        try:
+            await client.sign_in(password=code)
+        except Exception as e:
+            await msg.reply_text(f"Неверный пароль 2FA: {html.escape(str(e))}")
+            return
+    else:
+        try:
+            await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["hash"])
+        except SessionPasswordNeededError:
+            flow["stage"] = "2fa"
+            await msg.reply_text(
+                "На аккаунте включена 2FA. Пришлите пароль:\n<code>/code ВАШ_ПАРОЛЬ</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except PhoneCodeInvalidError:
+            await msg.reply_text("Неверный код. Попробуйте /login заново.")
+            _login_flow.pop(user.id, None)
+            await client.disconnect()
+            return
+        except Exception as e:
+            await msg.reply_text(f"Ошибка входа: {html.escape(str(e))}")
+            return
+
+    session_str = client.session.save()
+    _save_session_string(session_str)
+    global _user_client
+    _user_client = client
+    _login_flow.pop(user.id, None)
+
+    me = await client.get_me()
+    await msg.reply_text(
+        f"✅ Личный аккаунт подключён: {html.escape(me.first_name or '')} "
+        f"(@{html.escape(me.username or '—')})\n\n"
+        "Теперь можно искать и отправлять карточки: /find username\n\n"
+        "Чтобы сессия не терялась при редеплое на Render — наберите /session "
+        "и сохраните полученную строку в переменную окружения TG_SESSION.",
+    )
+
+
+async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the owner the raw Telethon session string, so they can pin it as
+    the TG_SESSION env var on Render and survive redeploys without /login again."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    if not _is_bot_owner(user.id):
+        await msg.reply_text("Эта команда доступна только владельцу бота.")
+        return
+
+    session_str = _load_session_string()
+    if not session_str:
+        await msg.reply_text("Личный аккаунт ещё не подключён. Сначала /login.")
+        return
+
+    await msg.reply_text(
+        "Скопируйте это значение в переменную окружения <code>TG_SESSION</code> "
+        "на Render (Settings → Environment), чтобы не логиниться заново после каждого деплоя:",
+        parse_mode=ParseMode.HTML,
+    )
+    # Sent as a separate plain message so the string itself is easy to copy in full.
+    await msg.reply_text(session_str)
+
+
+# ─── /find <username> — locate an existing chat, then collect amount + link ──
+
+_find_state: dict[int, dict] = {}  # owner_tg_id -> {"peer_id":.., "name":.., "stage":"amount"/"link", "amount":..}
+
+
+async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    if not _is_bot_owner(user.id):
+        return
+
+    args = ctx.args or []
+    if not args:
+        await msg.reply_text("Укажите юзернейм:\n<code>/find username</code>", parse_mode=ParseMode.HTML)
+        return
+
+    username = args[0].lstrip("@").strip()
+
+    try:
+        client = await _get_user_client()
+    except RuntimeError as e:
+        await msg.reply_text(str(e))
+        return
+
+    try:
+        entity = await client.get_entity(username)
+    except Exception:
+        await msg.reply_text(f"Пользователь @{html.escape(username)} не найден.")
+        return
+
+    # Confirm a chat with this person actually exists (dialog history present)
+    has_chat = False
+    try:
+        async for _ in client.iter_messages(entity, limit=1):
+            has_chat = True
+            break
+    except Exception:
+        has_chat = False
+
+    if not has_chat:
+        await msg.reply_text(
+            f"С @{html.escape(username)} ещё нет переписки — бот отправляет карточки "
+            "только в существующие чаты."
+        )
+        return
+
+    name = (getattr(entity, "first_name", "") or "") + " " + (getattr(entity, "last_name", "") or "")
+    name = name.strip() or username
+
+    _find_state[user.id] = {"peer_id": entity.id, "name": name, "username": username, "stage": "amount"}
+    await msg.reply_text(
+        f"Чат с <b>{html.escape(name)}</b> (@{html.escape(username)}) найден.\n\n"
+        "Укажите сумму в звёздах:",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _handle_find_flow_text(msg: Any, user_id: int, text: str) -> bool:
+    """Returns True if the text was consumed as part of an active /find flow."""
+    state = _find_state.get(user_id)
+    if not state:
+        return False
+
+    if text.lower() in {"/cancel", "отмена"}:
+        _find_state.pop(user_id, None)
+        await msg.reply_text("Отменено.")
+        return True
+
+    if state["stage"] == "amount":
+        amount = text.strip().replace(",", ".")
+        if not re.fullmatch(r"\d+(\.\d{1,2})?", amount):
+            await msg.reply_text("Сумма должна быть числом, например: 1000")
+            return True
+        state["amount"] = amount
+        state["stage"] = "link"
+        await msg.reply_text("Теперь пришлите ссылку на NFT (t.me/nft/...):")
+        return True
+
+    if state["stage"] == "link":
+        url = text.strip()
+        if url.lower().startswith(("t.me/", "www.t.me/", "telegram.me/")):
+            url = "https://" + url
+        try:
+            p = urlsplit(url)
+        except ValueError:
+            p = None
+        if not p or p.scheme not in ("http", "https") or (p.hostname or "").lower() not in TG_HOSTS:
+            await msg.reply_text("Непохоже на ссылку t.me/nft/... Пришлите корректную ссылку.")
+            return True
+
+        amount = state["amount"]
+        peer_id = state["peer_id"]
+        name = state["name"]
+        _find_state.pop(user_id, None)
+
+        try:
+            client = await _get_user_client()
+        except RuntimeError as e:
+            await msg.reply_text(str(e))
+            return True
+
+        card = nft_card(name, amount, url, with_emoji=False)
+        try:
+            await client.send_message(peer_id, card, parse_mode="html", link_preview=False)
+        except Exception as e:
+            err = str(e)
+            if "flood" in err.lower():
+                await msg.reply_text(
+                    "Telegram временно ограничил отправку (PEER_FLOOD). Подождите пару часов и повторите."
+                )
+            else:
+                await msg.reply_text(f"Не удалось отправить карточку: {html.escape(err[:300])}")
+            return True
+
+        await msg.reply_text(f"✅ Карточка отправлена — {html.escape(name)}, {html.escape(amount)} ⭐")
+        return True
+
+    return False
+
+
 # ─── App lifecycle ───────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -852,6 +1181,10 @@ async def lifespan(fastapi_app: FastAPI):
     tg.add_handler(CommandHandler("start",  cmd_start))
     tg.add_handler(CommandHandler("help",   cmd_help))
     tg.add_handler(CommandHandler("cancel", cmd_cancel))
+    tg.add_handler(CommandHandler("login",   cmd_login))
+    tg.add_handler(CommandHandler("code",    cmd_code))
+    tg.add_handler(CommandHandler("session", cmd_session))
+    tg.add_handler(CommandHandler("find",    cmd_find))
     tg.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
     tg.add_handler(CallbackQueryHandler(on_button))
     tg.add_handler(MessageHandler(
@@ -881,591 +1214,33 @@ async def lifespan(fastapi_app: FastAPI):
 
 
 async def _route_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route plain text in bot DM: .nft command or regular offer creation."""
-    msg = update.effective_message
-    if not msg or not msg.text:
+    """Route plain text in bot DM: /find flow, .nft command, or regular offer creation."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not msg.text or not user:
         return
     text = msg.text.strip()
+
+    if await _handle_find_flow_text(msg, user.id, text):
+        return
     if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
         await on_direct_nft(update, ctx)
     else:
         await receive_offer(update, ctx)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── DASHBOARD — Telethon personal account  ──────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-try:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.tl.functions.contacts import SearchRequest
-    from telethon.errors import SessionPasswordNeededError
-    _TELETHON_OK = True
-except ImportError:
-    _TELETHON_OK = False
-    log.warning("telethon not installed — dashboard disabled")
-
-DASH_DB_PATH = os.getenv("DASH_DB", "/tmp/dash.db")
-DASH_API_ID   = int(os.getenv("TG_API_ID", "0") or "0")
-DASH_API_HASH = os.getenv("TG_API_HASH", "")
-
-# ─── DB helpers ──────────────────────────────────────────────────────────────
-
-def _dash_db():
-    conn = sqlite3.connect(DASH_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS dash_sessions(
-        token TEXT PRIMARY KEY,
-        tg_session TEXT NOT NULL DEFAULT '',
-        phone TEXT NOT NULL DEFAULT '',
-        phone_code_hash TEXT NOT NULL DEFAULT '',
-        state TEXT NOT NULL DEFAULT 'anon',
-        created_at INTEGER NOT NULL
-    )""")
-    conn.commit()
-    return conn
-
-@contextmanager
-def dash_db():
-    conn = _dash_db()
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-def _dash_init():
-    with dash_db():
-        pass
-
-def _get_dash_session(token: str) -> dict | None:
-    with dash_db() as conn:
-        row = conn.execute("SELECT * FROM dash_sessions WHERE token=?", (token,)).fetchone()
-    return dict(row) if row else None
-
-def _set_dash_session(token: str, **kwargs):
-    with dash_db() as conn:
-        existing = conn.execute("SELECT token FROM dash_sessions WHERE token=?", (token,)).fetchone()
-        if existing:
-            sets = ", ".join(f"{k}=?" for k in kwargs)
-            conn.execute(f"UPDATE dash_sessions SET {sets} WHERE token=?",
-                         list(kwargs.values()) + [token])
-        else:
-            kwargs.setdefault("created_at", int(time.time()))
-            kwargs["token"] = token
-            cols = ", ".join(kwargs.keys())
-            vals = ", ".join("?" * len(kwargs))
-            conn.execute(f"INSERT INTO dash_sessions({cols}) VALUES({vals})",
-                         list(kwargs.values()))
-
-# ─── Telethon client factory ──────────────────────────────────────────────────
-
-def _make_client(session_str: str = "") -> "TelegramClient":
-    return TelegramClient(
-        StringSession(session_str),
-        DASH_API_ID, DASH_API_HASH,
-        device_model="NEZZX Dashboard",
-        system_version="Linux",
-        app_version="1.0",
-    )
-
-# ─── Cookie auth dependency ───────────────────────────────────────────────────
-
-COOKIE_NAME = "nezzx_dash"
-
-def _dash_token(request: Request) -> str | None:
-    return request.cookies.get(COOKIE_NAME)
-
-async def _require_auth(request: Request) -> dict:
-    token = _dash_token(request)
-    if not token:
-        raise HTTPException(status_code=401, detail="not_logged_in")
-    sess = _get_dash_session(token)
-    if not sess or sess["state"] != "ready":
-        raise HTTPException(status_code=401, detail="not_logged_in")
-    return sess
-
-# ─── Dashboard HTML ───────────────────────────────────────────────────────────
-
-_DASH_HTML = r"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NEZZX Dashboard</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
-.app{max-width:560px;margin:0 auto;padding:16px}
-h1{font-size:20px;font-weight:700;margin-bottom:20px;color:#58a6ff}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}
-.card h2{font-size:15px;font-weight:600;margin-bottom:14px;color:#8b949e}
-input,textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:8px;
-  color:#e6edf3;padding:10px 12px;font-size:14px;outline:none;margin-bottom:10px}
-input:focus,textarea:focus{border-color:#58a6ff}
-button{width:100%;padding:11px;border:none;border-radius:8px;font-size:14px;font-weight:600;
-  cursor:pointer;transition:.15s}
-.btn-primary{background:#238636;color:#fff}
-.btn-primary:hover{background:#2ea043}
-.btn-secondary{background:#21262d;color:#e6edf3;border:1px solid #30363d}
-.btn-secondary:hover{background:#30363d}
-.btn-danger{background:#da3633;color:#fff}
-.btn-sm{width:auto;padding:6px 14px;font-size:13px}
-.err{color:#f85149;font-size:13px;margin-top:-6px;margin-bottom:8px}
-.ok{color:#3fb950;font-size:13px;margin-top:-6px;margin-bottom:8px}
-.chat-list{list-style:none}
-.chat-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;
-  cursor:pointer;transition:.12s;border:1px solid transparent;margin-bottom:4px}
-.chat-item:hover{background:#21262d;border-color:#30363d}
-.chat-item.selected{background:#1f2d3d;border-color:#58a6ff}
-.avatar{width:38px;height:38px;border-radius:50%;background:#238636;display:flex;
-  align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0}
-.chat-name{font-size:14px;font-weight:500}
-.chat-sub{font-size:12px;color:#8b949e;margin-top:2px}
-.badge{background:#58a6ff;color:#0d1117;border-radius:10px;padding:1px 7px;font-size:11px;
-  font-weight:700;margin-left:auto}
-.sep{border:none;border-top:1px solid #21262d;margin:12px 0}
-.loader{text-align:center;color:#8b949e;padding:20px;font-size:13px}
-.tag{display:inline-block;background:#21262d;border-radius:6px;padding:2px 8px;
-  font-size:12px;color:#8b949e;margin-right:4px}
-#nft-panel{display:none}
-</style>
-</head>
-<body>
-<div class="app">
-<h1>⚡ NEZZX Dashboard</h1>
-<div id="root"></div>
-</div>
-<script>
-const $ = id => document.getElementById(id);
-const root = () => $('root');
-
-let state = {view:'loading', selected:null};
-
-async function api(path, opts={}) {
-  const r = await fetch('/dash/api' + path, {
-    method: opts.method || 'GET',
-    headers: opts.body ? {'Content-Type':'application/json'} : {},
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  const d = await r.json().catch(()=>({}));
-  if (!r.ok) throw d;
-  return d;
-}
-
-function showErr(el, msg) {
-  const e = typeof el === 'string' ? $(el) : el;
-  if (e) { e.className='err'; e.textContent=msg; }
-}
-function showOk(el, msg) {
-  const e = typeof el === 'string' ? $(el) : el;
-  if (e) { e.className='ok'; e.textContent=msg; }
-}
-
-// ── Login ─────────────────────────────────────────────────────────────────────
-function renderLogin(step='phone') {
-  root().innerHTML = `
-<div class="card">
-  <h2>Вход в аккаунт Telegram</h2>
-  ${step==='phone'?`
-  <input id="phone" type="tel" placeholder="+79991234567" autocomplete="tel">
-  <div id="msg" class="err"></div>
-  <button class="btn-primary" onclick="sendPhone()">Получить код</button>
-  `:`
-  <p style="font-size:13px;color:#8b949e;margin-bottom:12px">
-    Код отправлен в Telegram. Введите его ниже.</p>
-  <input id="code" type="text" placeholder="12345" maxlength="10" autocomplete="one-time-code">
-  <input id="pass2fa" type="password" placeholder="Пароль 2FA (если есть)" style="display:none">
-  <div id="msg" class="err"></div>
-  <button class="btn-primary" onclick="sendCode()">Войти</button>
-  `}
-</div>`;
-}
-
-async function sendPhone() {
-  const phone = $('phone').value.trim();
-  if (!phone) return showErr('msg','Введите номер');
-  $('msg').textContent = 'Отправляем...';
-  try {
-    await api('/send_code', {method:'POST', body:{phone}});
-    renderLogin('code');
-  } catch(e) { showErr('msg', e.detail || 'Ошибка'); }
-}
-
-async function sendCode() {
-  const code = $('code').value.trim();
-  const pass = $('pass2fa') ? $('pass2fa').value : '';
-  if (!code) return showErr('msg','Введите код');
-  $('msg').textContent = 'Проверяем...';
-  try {
-    await api('/verify_code', {method:'POST', body:{code, password:pass}});
-    init();
-  } catch(e) {
-    if (e.detail === '2fa_required') {
-      $('pass2fa').style.display = 'block';
-      showErr('msg','Введите пароль 2FA и нажмите Войти снова');
-    } else {
-      showErr('msg', e.detail || 'Неверный код');
-    }
-  }
-}
-
-// ── Main view ──────────────────────────────────────────────────────────────────
-function renderMain(chats) {
-  root().innerHTML = `
-<div class="card">
-  <h2>Поиск по юзернейму</h2>
-  <input id="search-q" type="text" placeholder="@username или имя" style="margin-bottom:6px">
-  <div id="search-msg" class="err"></div>
-  <button class="btn-secondary btn-sm" style="margin-bottom:0" onclick="doSearch()">Найти</button>
-</div>
-<div class="card">
-  <h2>Мои чаты <span style="font-size:12px;color:#8b949e">(последние 30)</span></h2>
-  <ul class="chat-list" id="chat-list">
-    ${chats.map(c=>`
-    <li class="chat-item" onclick="selectChat(${c.id},'${esc(c.name)}','${esc(c.username||'')}')">
-      <div class="avatar" style="background:${avatarColor(c.name)}">${c.name[0]||'?'}</div>
-      <div>
-        <div class="chat-name">${esc(c.name)}</div>
-        ${c.username?`<div class="chat-sub">@${esc(c.username)}</div>`:''}
-      </div>
-      ${c.unread?`<span class="badge">${c.unread}</span>`:''}
-    </li>`).join('')}
-  </ul>
-</div>
-<div class="card" id="nft-panel">
-  <h2>Отправить NFT-карточку → <span id="nft-to" style="color:#58a6ff"></span></h2>
-  <input id="nft-amount" type="number" placeholder="Сумма звёзд (напр. 1000)">
-  <input id="nft-url" type="text" placeholder="https://t.me/nft/LibertyFigure-14469">
-  <div id="nft-msg" class="err"></div>
-  <button class="btn-primary" onclick="sendNftCard()">Отправить карточку</button>
-  <hr class="sep">
-  <button class="btn-secondary" onclick="closeNft()">Отмена</button>
-</div>`;
-}
-
-function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
-function avatarColor(n){ const h=['#238636','#1158a7','#6e40c9','#bf8700','#953800'];return h[n.charCodeAt(0)%h.length] }
-
-function selectChat(id, name, username) {
-  state.selected = {id, name, username};
-  document.querySelectorAll('.chat-item').forEach(el=>el.classList.remove('selected'));
-  const all = document.querySelectorAll('.chat-item');
-  all.forEach(el=>{ if(el.onclick && el.onclick.toString().includes(String(id))) el.classList.add('selected') });
-  $('nft-panel').style.display = 'block';
-  $('nft-to').textContent = name + (username ? ' (@'+username+')' : '');
-  $('nft-msg').textContent = '';
-  $('nft-panel').scrollIntoView({behavior:'smooth', block:'nearest'});
-}
-
-function closeNft() {
-  $('nft-panel').style.display = 'none';
-  state.selected = null;
-  document.querySelectorAll('.chat-item').forEach(el=>el.classList.remove('selected'));
-}
-
-async function doSearch() {
-  const q = $('search-q').value.trim();
-  if (!q) return;
-  $('search-msg').textContent = 'Ищем...';
-  try {
-    const d = await api('/search?q=' + encodeURIComponent(q));
-    if (!d.results.length) { showErr('search-msg','Никого не нашли'); return; }
-    $('search-msg').textContent = '';
-    const list = $('chat-list');
-    const item = d.results[0];
-    // prepend result
-    const li = document.createElement('li');
-    li.className = 'chat-item';
-    li.innerHTML = `
-      <div class="avatar" style="background:#1158a7">${item.name[0]||'?'}</div>
-      <div>
-        <div class="chat-name">${esc(item.name)} <span class="tag">найден</span></div>
-        ${item.username?'<div class="chat-sub">@'+esc(item.username)+'</div>':''}
-      </div>`;
-    li.onclick = ()=>selectChat(item.id, item.name, item.username||'');
-    list.prepend(li);
-    li.scrollIntoView({behavior:'smooth',block:'nearest'});
-  } catch(e){ showErr('search-msg', e.detail||'Ошибка поиска') }
-}
-
-async function sendNftCard() {
-  const amount = $('nft-amount').value.trim();
-  const url    = $('nft-url').value.trim();
-  if (!amount || !url) return showErr('nft-msg','Заполните оба поля');
-  if (!state.selected) return showErr('nft-msg','Выберите чат');
-  $('nft-msg').textContent = 'Отправляем...';
-  try {
-    await api('/send_nft', {method:'POST', body:{
-      chat_id: state.selected.id,
-      chat_name: state.selected.name,
-      amount, url
-    }});
-    showOk('nft-msg','✅ Карточка отправлена!');
-    $('nft-amount').value=''; $('nft-url').value='';
-  } catch(e){ showErr('nft-msg', e.detail||'Ошибка отправки') }
-}
-
-async function init() {
-  try {
-    const d = await api('/me');
-    if (!d.ok) { renderLogin(); return; }
-  } catch(e) { renderLogin(); return; }
-  root().innerHTML = '<div class="loader">Загружаем чаты...</div>';
-  try {
-    const d = await api('/chats');
-    renderMain(d.chats);
-  } catch(e) { root().innerHTML = '<div class="loader">Ошибка загрузки чатов</div>'; }
-}
-
-init();
-</script>
-</body>
-</html>"""
-
 # ─── FastAPI ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="NEZZX Bot", lifespan=lifespan)
 
 
-_dash_init()
+@app.get("/")
+async def root() -> dict:
+    return {"service": "NEZZX Telegram Bot", "status": "running"}
 
-# ─── Dashboard routes ─────────────────────────────────────────────────────────
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTMLResponse(_DASH_HTML)
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
-
-@app.get("/dash", response_class=HTMLResponse)
-async def dash_page():
-    return HTMLResponse(_DASH_HTML)
-
-# ── Pydantic models ───────────────────────────────────────────────────────────
-
-class PhoneBody(BaseModel):
-    phone: str = Field(min_length=5, max_length=20)
-
-class CodeBody(BaseModel):
-    code: str = Field(min_length=1, max_length=20)
-    password: str = Field(default="", max_length=200)
-
-class SendNftBody(BaseModel):
-    chat_id: int
-    chat_name: str = Field(max_length=200)
-    amount: str = Field(min_length=1, max_length=20)
-    url: str = Field(min_length=5, max_length=500)
-
-# ── /dash/api/send_code ───────────────────────────────────────────────────────
-
-@app.post("/dash/api/send_code")
-async def dash_send_code(payload: PhoneBody, request: Request, response: Response):
-    if not _TELETHON_OK:
-        raise HTTPException(503, "Telethon не установлен. Добавьте telethon в requirements.txt")
-    if not DASH_API_ID or not DASH_API_HASH:
-        raise HTTPException(503, "Добавьте TG_API_ID и TG_API_HASH в переменные окружения Render")
-
-    token = _dash_token(request) or secrets.token_urlsafe(32)
-    client = _make_client()
-    try:
-        await client.connect()
-        result = await client.send_code_request(payload.phone)
-        session_str = client.session.save()
-    except Exception as e:
-        raise HTTPException(400, str(e))
-    finally:
-        await client.disconnect()
-
-    _set_dash_session(token,
-        tg_session=session_str,
-        phone=payload.phone,
-        phone_code_hash=result.phone_code_hash,
-        state="code_sent",
-        created_at=int(time.time()),
-    )
-    response.set_cookie(COOKIE_NAME, token, max_age=86400*30, httponly=True, samesite="lax")
-    return {"ok": True}
-
-# ── /dash/api/verify_code ─────────────────────────────────────────────────────
-
-@app.post("/dash/api/verify_code")
-async def dash_verify_code(payload: CodeBody, request: Request, response: Response):
-    token = _dash_token(request)
-    sess = token and _get_dash_session(token)
-    if not sess or sess["state"] not in ("code_sent", "2fa"):
-        raise HTTPException(401, "Начните заново — отправьте номер")
-
-    client = _make_client(sess["tg_session"])
-    try:
-        await client.connect()
-        if sess["state"] == "2fa" or (payload.password and sess["state"] == "code_sent"):
-            # 2FA flow
-            try:
-                await client.sign_in(password=payload.password)
-            except Exception as e:
-                raise HTTPException(400, str(e))
-        else:
-            try:
-                await client.sign_in(
-                    phone=sess["phone"],
-                    code=payload.code,
-                    phone_code_hash=sess["phone_code_hash"],
-                )
-            except SessionPasswordNeededError:
-                session_str = client.session.save()
-                _set_dash_session(token, tg_session=session_str, state="2fa")
-                await client.disconnect()
-                raise HTTPException(400, "2fa_required")
-            except Exception as e:
-                raise HTTPException(400, str(e))
-
-        session_str = client.session.save()
-    finally:
-        await client.disconnect()
-
-    _set_dash_session(token, tg_session=session_str, state="ready")
-    response.set_cookie(COOKIE_NAME, token, max_age=86400*30, httponly=True, samesite="lax")
-    return {"ok": True}
-
-# ── /dash/api/me ──────────────────────────────────────────────────────────────
-
-@app.get("/dash/api/me")
-async def dash_me(request: Request):
-    token = _dash_token(request)
-    sess = token and _get_dash_session(token)
-    if not sess or sess["state"] != "ready":
-        raise HTTPException(401, "not_logged_in")
-    client = _make_client(sess["tg_session"])
-    try:
-        await client.connect()
-        me = await client.get_me()
-        return {"ok": True, "id": me.id, "name": me.first_name,
-                "username": me.username or ""}
-    except Exception as e:
-        raise HTTPException(401, str(e))
-    finally:
-        await client.disconnect()
-
-# ── /dash/api/chats ───────────────────────────────────────────────────────────
-
-@app.get("/dash/api/chats")
-async def dash_chats(request: Request):
-    sess = await _require_auth(request)
-    client = _make_client(sess["tg_session"])
-    try:
-        await client.connect()
-        dialogs = await client.get_dialogs(limit=30)
-        chats = []
-        for d in dialogs:
-            e = d.entity
-            name = getattr(e, "first_name", None) or getattr(e, "title", None) or "Unknown"
-            last = getattr(e, "last_name", None)
-            if last:
-                name = name + " " + last
-            chats.append({
-                "id": e.id,
-                "name": name,
-                "username": getattr(e, "username", None) or "",
-                "unread": d.unread_count,
-            })
-        return {"chats": chats}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        await client.disconnect()
-
-# ── /dash/api/search ──────────────────────────────────────────────────────────
-
-@app.get("/dash/api/search")
-async def dash_search(q: str, request: Request):
-    sess = await _require_auth(request)
-    if not q.strip():
-        raise HTTPException(422, "Введите запрос")
-    client = _make_client(sess["tg_session"])
-    try:
-        await client.connect()
-        results = []
-        # Try resolve by username first
-        try:
-            entity = await client.get_entity(q.lstrip("@"))
-            name = getattr(entity, "first_name", None) or getattr(entity, "title", None) or q
-            last = getattr(entity, "last_name", None)
-            if last:
-                name = name + " " + last
-            results.append({
-                "id": entity.id,
-                "name": name,
-                "username": getattr(entity, "username", None) or "",
-            })
-        except Exception:
-            pass
-        # Also try global search
-        if not results and _TELETHON_OK:
-            try:
-                r = await client(SearchRequest(q=q, limit=5))
-                for u in (r.users if hasattr(r, "users") else []):
-                    name = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
-                    results.append({"id": u.id, "name": name.strip() or q,
-                                    "username": u.username or ""})
-            except Exception:
-                pass
-        if not results:
-            raise HTTPException(404, "Пользователь не найден")
-        return {"results": results[:5]}
-    finally:
-        await client.disconnect()
-
-# ── /dash/api/send_nft ────────────────────────────────────────────────────────
-
-@app.post("/dash/api/send_nft")
-async def dash_send_nft(payload: SendNftBody, request: Request):
-    sess = await _require_auth(request)
-
-    # Validate NFT url via existing parse_nft logic
-    nft_text = f".nft {payload.amount} {payload.url}"
-    parsed = parse_nft(nft_text)
-    if not parsed:
-        raise HTTPException(422, "Неверная сумма или ссылка NFT")
-
-    amount, url = parsed
-    client = _make_client(sess["tg_session"])
-    try:
-        await client.connect()
-        me = await client.get_me()
-        seller_id = me.id
-
-        entity = await client.get_entity(payload.chat_id)
-        buyer_name = (
-            getattr(entity, "username", None)
-            and f"@{entity.username}"
-            or getattr(entity, "first_name", None)
-            or payload.chat_name
-        )
-
-        # Build card text (same logic as nft_card but send via Telethon)
-        nft_name, nft_num = nft_details(url)
-        label = f"{nft_name} · {nft_num}" if nft_num else nft_name
-        safe_url = url
-        card_md = (
-            f"**{buyer_name}** хочет купить ваш подарок за "
-            f"**⭐ {fmt_amount(amount)}** звёзд\n\n"
-            f"{label}\n[Ссылка на подарок]({safe_url})"
-        )
-        await client.send_message(payload.chat_id, card_md, link_preview=False)
-        log.info("Dashboard NFT card sent to chat_id=%s amount=%s", payload.chat_id, amount)
-        return {"ok": True}
-    except Exception as e:
-        err = str(e)
-        if "peer_flood" in err.lower() or "flood" in err.lower():
-            raise HTTPException(429, "Telegram ограничил отправку (PEER_FLOOD). Подождите несколько часов.")
-        raise HTTPException(500, err)
-    finally:
-        await client.disconnect()
 
 
 @app.post(WEBHOOK_PATH)
