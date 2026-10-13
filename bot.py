@@ -4,7 +4,6 @@ env vars:
   BOT_TOKEN            required
   WEBHOOK_SECRET       required, >= 8 chars
   WEBHOOK_URL          required, https://...
-  SELLER_TELEGRAM_ID   optional, your Telegram numeric ID
   PREMIUM_STICKER_FILE_ID  optional
 """
 
@@ -559,18 +558,22 @@ async def on_biz_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         log.info("Business connection disabled, skipping: %s", conn_id)
         return
 
-    # suppress self-sent messages from the Business account owner
-    sender = msg.from_user
-    is_owner = bool(sender and conn and sender.id == conn.get("user_id"))
-
+    # Ignore messages sent by the bot itself
     if getattr(msg, "sender_business_bot", False):
         return
 
+    sender   = msg.from_user
+    # The Business account owner is the person who connected the bot.
+    # conn["user_id"] is that owner's Telegram ID.
+    owner_id = int(conn["user_id"]) if conn and conn.get("user_id") else None
+    is_owner = bool(sender and owner_id and sender.id == owner_id)
+
     parsed = parse_nft(text)
 
-    # Owner writes: .nft <price> <link>  →  send offer card to buyer's chat
+    # ── OWNER writes .nft <amount> <link> in a chat with their buyer ─────────
+    # Any user who connected the bot can do this — no hardcoded seller ID.
     if is_owner and parsed:
-        seller_id  = int(conn["user_id"]) if conn and conn.get("user_id") else 0
+        seller_id  = owner_id or 0
         buyer_id   = int(msg.chat_id)
         chat       = msg.chat
         buyer_name = (
@@ -583,29 +586,31 @@ async def on_biz_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             seller_id, buyer_id, buyer_name,
         )
         if sent_ok:
+            # Delete the owner's .nft command so the chat stays clean
             try:
                 await ctx.bot.delete_business_messages(
                     business_connection_id=conn_id,
                     message_ids=[msg.message_id],
                 )
+                log.info("Deleted .nft command: chat_id=%s msg_id=%s", msg.chat_id, msg.message_id)
             except (AttributeError, TelegramError) as e:
                 log.warning("Could not delete .nft command: %s", e)
         return
 
-    # Ignore .nft from non-owner (buyer accidentally typed it)
+    # ── BUYER accidentally types .nft → ignore silently ──────────────────────
     if parsed or re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
         return
 
-    # Owner messages that don't match .nft → ignore (do not auto-reply to owner)
-    if is_owner:
-        return
-
-    # Owner is creating an offer in Business flow
-    if ctx.user_data.get("awaiting_biz_offer"):
+    # ── OWNER is mid-flow creating a regular offer card ──────────────────────
+    if is_owner and ctx.user_data.get("awaiting_biz_offer"):
         await _finish_biz_offer(msg, ctx, conn_id)
         return
 
-    # Standard away reply to incoming customer messages
+    # ── OWNER sends any other message → don't auto-reply ─────────────────────
+    if is_owner:
+        return
+
+    # ── Incoming message from BUYER → away reply ─────────────────────────────
     sticker_id = os.getenv("PREMIUM_STICKER_FILE_ID", "").strip()
     if sticker_id:
         try:
@@ -737,6 +742,10 @@ async def send_nft_card(
 # ─── Direct .nft in bot DM ───────────────────────────────────────────────────
 
 async def on_direct_nft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    .nft typed directly in the bot's own DM chat.
+    The person typing IS the seller; buyer_id = 0 (preview mode, no counter-party).
+    """
     msg  = update.effective_message
     user = update.effective_user
     if not msg or not user or not msg.text:
@@ -744,23 +753,19 @@ async def on_direct_nft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     parsed = parse_nft(msg.text.strip())
     if not parsed:
-        await msg.reply_text("Формат команды: .nft 1000 t.me/nft/LibertyFigure-14469")
+        await msg.reply_text(
+            "Формат команды:\n<code>.nft 1000 t.me/nft/LibertyFigure-14469</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    env_seller = os.getenv("SELLER_TELEGRAM_ID", "").strip()
-    try:
-        seller_id = int(env_seller) if env_seller else 0
-    except ValueError:
-        seller_id = 0
-    if seller_id == user.id:
-        seller_id = 0
+    # In a direct bot chat there is no buyer — seller_id = user, buyer_id = 0
+    seller_id  = user.id
+    buyer_id   = 0
+    buyer_name = "Покупатель"   # placeholder; no real buyer in DM preview
 
-    buyer_name = (
-        f"@{user.username}" if user.username
-        else (user.first_name or f"Покупатель {user.id}")
-    )
     await send_nft_card(ctx, msg.chat_id, None, parsed[0], parsed[1],
-                        seller_id, user.id, buyer_name)
+                        seller_id, buyer_id, buyer_name)
 
 
 # ─── Business connection update ──────────────────────────────────────────────
