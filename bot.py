@@ -1,15 +1,30 @@
+"""
+NEZZX Deal Bot — rewrite
+env vars:
+  BOT_TOKEN            required
+  WEBHOOK_SECRET       required, >= 8 chars
+  WEBHOOK_URL          required, https://...
+  PREMIUM_STICKER_FILE_ID  optional
+"""
+
 import html
+import io
 import logging
 import os
 import re
-from contextlib import asynccontextmanager
+import secrets
+import sqlite3
+import time
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks, Cookie, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     BusinessConnectionHandler,
@@ -20,283 +35,410 @@ from telegram.ext import (
     filters,
 )
 
+# ─── Logging ────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("nezzx-deal-bot")
+log = logging.getLogger("nezzx-bot")
+
+# ─── Constants ──────────────────────────────────────────────────────────────
 
 WEBHOOK_PATH = "/telegram/webhook"
-MAX_OFFER_LENGTH = 1500
+MAX_OFFER_LEN = 1500
 
-# Telegram custom emoji IDs supplied by the project owner.
-EMOJI_OFFER = "5330237710655306682"
-EMOJI_CONFIRM = "5206607081334906820"
-EMOJI_SAFE_DEAL = "5251203410396458957"
-EMOJI_STARS = "5438496463044752972"
-EMOJI_WARNING = "5251340119205501791"
+# Custom emoji IDs (Telegram Premium)
+E_OFFER   = "5330237710655306682"
+E_CONFIRM = "5206607081334906820"
+E_SHIELD  = "5251203410396458957"
+E_STARS   = "5438496463044752972"
+E_WARN    = "5251340119205501791"
 
-
-def custom_emoji(emoji_id: str, fallback: str) -> str:
-    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+TG_HOSTS = {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
 
 
-def warning_footer() -> str:
-    # Keep the warning clear without falsely claiming Telegram officially protects this bot.
+def em(eid: str, fb: str) -> str:
+    return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+
+
+# ─── Texts ──────────────────────────────────────────────────────────────────
+
+def _warn() -> str:
     return (
-        f"\n\n{custom_emoji(EMOJI_WARNING, '⚠️')} <b>Внимание!</b> Предупреждение о мошенниках: "
-        "не доверяйте незнакомым участникам и самостоятельно проверяйте оплату. "
-        "Telegram не подтверждает и не гарантирует сделки через этого бота."
+        f"\n\n{em(E_WARN,'⚠️')} <b>Внимание!</b> "
+        "Не доверяйте незнакомым участникам и проверяйте оплату самостоятельно. "
+        "Telegram не гарантирует сделки через этого бота."
     )
 
 
-def welcome_text() -> str:
-    # The private bot is only an entry point; deals are handled in Business chats.
-    return "Сделки тут."
-
-
-def main_keyboard() -> InlineKeyboardMarkup | None:
-    # No deal-creation menu in the bot's private chat.
-    return None
-
-
-def cancel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Отмена", callback_data="cancel_offer")]]
+def _welcome() -> str:
+    return (
+        "<b>NEZZX — предложения и сделки</b>\n\n"
+        "Создайте предложение с описанием условий и отправьте карточку второму участнику.\n\n"
+        f"{em(E_SHIELD,'🛡️')} <b>Важно:</b> бот не принимает, не хранит и не переводит деньги."
+        + _warn()
     )
 
 
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Назад в меню", callback_data="main_menu")]]
+# ─── Keyboards ──────────────────────────────────────────────────────────────
+
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Создать предложение", callback_data="create_offer")],
+        [InlineKeyboardButton("Безопасная сделка",   callback_data="safe_deal")],
+        [InlineKeyboardButton("Как это работает",    callback_data="how_it_works")],
+    ])
+
+
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Отмена", callback_data="cancel_offer")]
+    ])
+
+
+def kb_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Назад в меню", callback_data="main_menu")]
+    ])
+
+
+def kb_offer(creator_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Подтвердить условия", callback_data=f"confirm:{creator_id}"),
+            InlineKeyboardButton("Отклонить",           callback_data=f"reject:{creator_id}"),
+        ],
+        [InlineKeyboardButton("Безопасная сделка — инфо", callback_data=f"safe:{creator_id}")],
+    ])
+
+
+def kb_nft(seller_id: int, buyer_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Принять",   callback_data=f"nft_accept:{seller_id}:{buyer_id}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"nft_reject:{seller_id}:{buyer_id}"),
+        ]
+    ])
+
+
+# ─── NFT helpers ────────────────────────────────────────────────────────────
+
+def parse_nft(text: str) -> tuple[str, str] | None:
+    """Return (amount, url) from `.nft <amount> <url>` or None."""
+    m = re.search(r"(?im)^\s*\.nft\s+(\d+(?:[.,]\d{1,2})?)\s+(\S+)\s*$", text.strip())
+    if not m:
+        return None
+
+    amount = m.group(1).replace(",", ".")
+    raw = m.group(2).rstrip(".,;)")
+
+    if raw.lower().startswith(("t.me/", "www.t.me/", "telegram.me/", "www.telegram.me/")):
+        raw = "https://" + raw
+
+    try:
+        p = urlsplit(raw)
+    except ValueError:
+        return None
+
+    host = (p.hostname or "").lower()
+    if p.scheme.lower() not in {"http", "https"} or not host or not p.path:
+        return None
+    if p.username or p.password or not re.fullmatch(r"[a-z0-9.-]+", host):
+        return None
+
+    return amount, raw
+
+
+def nft_details(url: str) -> tuple[str, str]:
+    """(collectible_name, '#number') parsed from a t.me/nft/... URL."""
+    p = urlsplit(url)
+    host = (p.hostname or "").lower()
+    parts = [unquote(x) for x in p.path.strip("/").split("/") if x]
+
+    if host in TG_HOSTS and len(parts) >= 2 and parts[0].lower() == "nft":
+        slug = parts[1]
+        m = re.fullmatch(r"(.+?)-(\d+)", slug)
+        if m:
+            name, serial = m.groups()
+            name = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+            name = re.sub(r"[_-]+", " ", name).strip()
+            return name or "Telegram NFT", f"#{serial}"
+        return slug or "Telegram NFT", ""
+    return "NFT", ""
+
+
+def fmt_amount(amount: str) -> str:
+    try:
+        n = float(amount)
+        return f"{int(n):,}".replace(",", " ") if n.is_integer() else amount
+    except (ValueError, TypeError):
+        return amount
+
+
+def nft_card(buyer_name: str, amount: str, url: str, with_emoji: bool = True) -> str:
+    name, number = nft_details(url)
+    safe_url = html.escape(url, quote=True)
+    stars = em(E_STARS, "⭐") if with_emoji else "⭐"
+    label = f"{html.escape(name)} · {html.escape(number)}" if number else html.escape(name)
+    return (
+        f"<b>{html.escape(buyer_name)}</b> хочет купить ваш подарок за "
+        f"<b>{stars} {html.escape(fmt_amount(amount))}</b> звёзд\n\n"
+        f"{label}\n"
+        f'<a href="{safe_url}">Ссылка на подарок</a>'
     )
 
 
-async def safe_edit_text(query: Any, text: str, **kwargs: Any) -> bool:
-    """Edit the existing bot message in place; never delete/repost for menu navigation."""
-    if query.message is None:
-        return False
-    # Business messages must be edited in the context of their connection.
-    business_connection_id = getattr(query.message, "business_connection_id", None)
-    if business_connection_id and "business_connection_id" not in kwargs:
-        kwargs["business_connection_id"] = business_connection_id
+# ─── Business connection cache ───────────────────────────────────────────────
+
+async def get_conn_info(connection_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    cache: dict = ctx.bot_data.setdefault("biz_connections", {})
+    if connection_id in cache:
+        return cache[connection_id]
+    try:
+        conn = await ctx.bot.get_business_connection(connection_id)
+        rights = getattr(conn, "rights", None)
+        info = {
+            "user_id":    conn.user.id,
+            "user_name":  conn.user.full_name,
+            "is_enabled": conn.is_enabled,
+            "can_reply":  getattr(rights, "can_reply", None) if rights else None,
+        }
+        cache[connection_id] = info
+        return info
+    except TelegramError as e:
+        log.warning("Could not fetch business connection %s: %s", connection_id, e)
+        return None
+
+
+# ─── Safe send helpers ───────────────────────────────────────────────────────
+
+async def safe_send(ctx: ContextTypes.DEFAULT_TYPE, *, chat_id: int,
+                    connection_id: str | None = None,
+                    error_sink: list[str] | None = None,
+                    **kwargs) -> Any | None:
+    """Send a message; return the sent Message or None on failure.
+
+    If error_sink is passed, the exact Telegram error text is appended to it,
+    so a caller can surface the real rejection reason to the chat/logs instead
+    of a generic failure notice.
+    """
+    kw: dict = {"chat_id": chat_id, **kwargs}
+    if connection_id:
+        kw["business_connection_id"] = connection_id
+    try:
+        return await ctx.bot.send_message(**kw)
+    except TelegramError as e:
+        log.exception("send_message failed chat_id=%s conn=%s: %s", chat_id, connection_id, e)
+        if error_sink is not None:
+            error_sink.append(str(e))
+        return None
+
+
+async def safe_edit(query: Any, text: str, **kwargs) -> bool:
     try:
         await query.edit_message_text(text=text, **kwargs)
         return True
-    except BadRequest as exc:
-        # Telegram returns this when the content already matches; that's not a real failure.
-        if "message is not modified" in str(exc).lower():
+    except TelegramError as e:
+        if "message is not modified" in str(e).lower():
             return True
-        logger.info("Could not edit current message: %s", exc)
-        return False
-    except TelegramError as exc:
-        logger.warning("Could not edit current message: %s", exc)
+        log.warning("edit_message_text failed: %s", e)
         return False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("awaiting_offer", None)
-    context.user_data.pop("awaiting_business_offer", None)
-    context.user_data.pop("business_connection_id", None)
-    context.user_data.pop("flow_message_id", None)
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text("Сделки тут.")
+# ─── /start  /help  /cancel ──────────────────────────────────────────────────
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(
-            "Нажмите «Создать предложение» и отправьте текст с условиями. "
-            "Бот создаст карточку с кнопками подтверждения и отклонения.\n\n"
-            "Подтверждение означает только согласие с текстом карточки. Оно не доказывает оплату. "
-            "Не сообщайте коды входа, пароли или данные банковских карт."
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.clear()
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            _welcome(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main(),
+            disable_web_page_preview=True,
         )
 
 
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            "Нажмите «Создать предложение» и отправьте текст с условиями.\n\n"
+            "Подтверждение означает только согласие с карточкой — не подтверждает оплату.\n"
+            "Не сообщайте пароли, коды входа и данные карт.",
+            disable_web_page_preview=True,
+        )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.clear()
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("Отменено.", reply_markup=kb_main())
+
+
+# ─── Inline button router ────────────────────────────────────────────────────
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query is None or query.data is None:
+    if not query or not query.data:
         return
 
     data = query.data
 
-    if data == "create_offer":
-        is_business_message = bool(
-            query.message is not None
-            and getattr(query.message, "business_connection_id", None)
-        )
-        if is_business_message:
-            context.user_data.pop("awaiting_offer", None)
-            context.user_data["awaiting_business_offer"] = True
-            context.user_data["business_connection_id"] = query.message.business_connection_id
-        else:
-            context.user_data.pop("awaiting_business_offer", None)
-            context.user_data["awaiting_offer"] = True
-        if query.message is not None:
-            context.user_data["flow_chat_id"] = query.message.chat_id
-            context.user_data["flow_message_id"] = query.message.message_id
+    # ── main menu navigation ─────────────────────────────────────────────────
+    if data == "main_menu":
+        ctx.user_data.clear()
         await query.answer()
-        edited = await safe_edit_text(
-            query,
-            "<b>Создание предложения</b>\n\n"
-            "Отправьте одним сообщением описание: что предлагается и какие условия.\n\n"
-            "Не указывайте пароли, коды подтверждения или полные данные банковских карт."
-            + warning_footer(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_keyboard(),
-            disable_web_page_preview=True,
-        )
-        if not edited:
-            # Fallback only if Telegram does not permit editing the current message.
-            if query.message is not None:
-                fallback_text = (
-                    "Отправьте одним сообщением описание предложения. Для отмены используйте /cancel."
-                    + warning_footer()
-                )
-                if is_business_message:
-                    sent = await context.bot.send_message(
-                        chat_id=query.message.chat_id,
-                        business_connection_id=query.message.business_connection_id,
-                        text=fallback_text,
+        await safe_edit(query, _welcome(),
                         parse_mode=ParseMode.HTML,
-                        reply_markup=cancel_keyboard(),
-                    )
-                else:
-                    sent = await query.message.reply_text(
-                        fallback_text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=cancel_keyboard(),
-                    )
-                context.user_data["flow_chat_id"] = sent.chat_id
-                context.user_data["flow_message_id"] = sent.message_id
+                        reply_markup=kb_main(),
+                        disable_web_page_preview=True)
         return
 
-    if data == "main_menu":
-        context.user_data.pop("awaiting_offer", None)
-        context.user_data.pop("awaiting_business_offer", None)
-        context.user_data.pop("business_connection_id", None)
-        context.user_data.pop("flow_chat_id", None)
-        context.user_data.pop("flow_message_id", None)
+    if data == "how_it_works":
         await query.answer()
-        await safe_edit_text(
+        await safe_edit(
             query,
-            welcome_text(),
+            "<b>Как это работает</b>\n\n"
+            "1. Создайте карточку предложения.\n"
+            "2. Передайте карточку второму участнику.\n"
+            "3. Участник подтверждает условия или отклоняет предложение.\n\n"
+            "Подтверждение не доказывает оплату или передачу товара." + _warn(),
             parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
+            reply_markup=kb_back(),
             disable_web_page_preview=True,
         )
         return
 
     if data == "safe_deal":
-        await query.answer(
-            "Бот не хранит деньги и не гарантирует исполнение сделки. Самостоятельно проверяйте оплату "
-            "в официальном приложении и не доверяйте скриншотам переводов.",
-            show_alert=True,
-        )
-        return
-
-    if data == "how_it_works":
         await query.answer()
-        await safe_edit_text(
+        await safe_edit(
             query,
-            "<b>Как это работает</b>\n\n"
-            "1. Создайте карточку предложения.\n"
-            "2. Передайте карточку второму участнику.\n"
-            "3. Участник может подтвердить условия или отклонить предложение.\n\n"
-            "Подтверждение означает только согласие с текстом карточки. Оно не доказывает оплату, "
-            "подлинность товара или выполнение обязательств."
-            + warning_footer(),
+            "<b>Безопасная сделка</b>\n\n"
+            "Бот не является эскроу-сервисом и не принимает деньги. "
+            "Он создаёт карточку с условиями, которую обе стороны могут подтвердить. "
+            "Проверяйте условия самостоятельно." + _warn(),
             parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard(),
+            reply_markup=kb_back(),
             disable_web_page_preview=True,
         )
         return
 
     if data == "cancel_offer":
-        context.user_data.pop("awaiting_offer", None)
-        context.user_data.pop("awaiting_business_offer", None)
-        context.user_data.pop("business_connection_id", None)
-        context.user_data.pop("flow_chat_id", None)
-        context.user_data.pop("flow_message_id", None)
-        await query.answer("Создание предложения отменено.")
-        await safe_edit_text(
-            query,
-            welcome_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-            disable_web_page_preview=True,
-        )
+        ctx.user_data.clear()
+        await query.answer("Отменено.")
+        await safe_edit(query, _welcome(),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb_main(),
+                        disable_web_page_preview=True)
         return
 
-    # Compact NFT purchase workflow: only the connected business-account owner
-    # may accept or reject a buyer's offer.
+    if data == "create_offer":
+        is_biz = bool(
+            query.message and getattr(query.message, "business_connection_id", None)
+        )
+        ctx.user_data.clear()
+        if is_biz:
+            ctx.user_data["awaiting_biz_offer"] = True
+            ctx.user_data["biz_conn_id"] = query.message.business_connection_id
+        else:
+            ctx.user_data["awaiting_offer"] = True
+
+        if query.message:
+            ctx.user_data["flow_chat_id"] = query.message.chat_id
+            ctx.user_data["flow_msg_id"]  = query.message.message_id
+
+        prompt = (
+            "<b>Создание предложения</b>\n\n"
+            "Отправьте одним сообщением описание: что предлагается и на каких условиях.\n\n"
+            "Не указывайте пароли, коды подтверждения и данные банковских карт." + _warn()
+        )
+        await query.answer()
+        ok = await safe_edit(query, prompt,
+                             parse_mode=ParseMode.HTML,
+                             reply_markup=kb_cancel(),
+                             disable_web_page_preview=True)
+        if not ok and query.message:
+            conn_id = ctx.user_data.get("biz_conn_id")
+            sent = await safe_send(
+                ctx,
+                chat_id=query.message.chat_id,
+                connection_id=conn_id,
+                text=prompt,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel(),
+            )
+            if sent:
+                ctx.user_data["flow_chat_id"] = sent.chat_id
+                ctx.user_data["flow_msg_id"]  = sent.message_id
+        return
+
+    # ── NFT accept / reject ──────────────────────────────────────────────────
     if data.startswith(("nft_accept:", "nft_reject:")):
         try:
-            action, seller_text, buyer_text = data.split(":", maxsplit=2)
-            seller_id = int(seller_text)
-            buyer_id = int(buyer_text)
+            action, s_txt, b_txt = data.split(":", maxsplit=2)
+            seller_id = int(s_txt)
+            buyer_id  = int(b_txt)
         except (ValueError, TypeError):
-            await query.answer("Предложение некорректно.", show_alert=True)
+            await query.answer("Некорректные данные.", show_alert=True)
             return
 
         actor = query.from_user
-        if actor.id != seller_id:
-            await query.answer("Решение может принять только владелец Business-аккаунта.", show_alert=True)
+        if seller_id and actor.id != seller_id:
+            await query.answer("Решение может принять только продавец.", show_alert=True)
+            return
+        if not seller_id and actor.id == buyer_id:
+            await query.answer("Покупатель не может принять своё предложение.", show_alert=True)
             return
 
-        message = query.message
-        if message is None:
+        msg = query.message
+        if not msg:
             await query.answer("Сообщение недоступно.", show_alert=True)
             return
 
-        offer_key = f"{message.chat_id}:{message.message_id}"
-        states: dict[str, dict[str, Any]] = context.bot_data.setdefault("offer_states", {})
-        if offer_key in states:
+        key = f"{msg.chat_id}:{msg.message_id}"
+        states: dict = ctx.bot_data.setdefault("offer_states", {})
+        if key in states:
             await query.answer("По этому предложению уже принято решение.", show_alert=True)
             return
+        states[key] = {"action": action}
 
-        states[offer_key] = {"action": action, "seller_id": seller_id, "buyer_id": buyer_id}
         if action == "nft_accept":
-            result_text = (
-                "<b>Предложение принято</b>\n\n"
-                "Откройте меню подарков Telegram и выберите покупателя вручную. "
-                "Бот не может сам подтвердить или выполнить передачу коллекционного NFT."
-            )
-            result_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Открыть меню подарков", url="tg://settings/send-gift")]
-            ])
             await query.answer("Предложение принято")
+            await safe_edit(
+                query,
+                "<b>Предложение принято</b>\n\n"
+                "Откройте меню подарков Telegram и выберите покупателя вручную.\n"
+                "Бот не может сам передать коллекционный NFT.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Открыть меню подарков", url="tg://settings/send-gift")
+                ]]),
+                disable_web_page_preview=True,
+            )
         else:
-            result_text = "<b>Предложение отклонено</b>"
-            result_keyboard = None
             await query.answer("Предложение отклонено")
-
-        await safe_edit_text(
-            query,
-            result_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=result_keyboard,
-            disable_web_page_preview=True,
-        )
+            await safe_edit(query, "<b>Предложение отклонено</b>", parse_mode=ParseMode.HTML)
         return
 
+    # ── Regular offer confirm / reject / safe ────────────────────────────────
     parts = data.split(":", maxsplit=1)
     if len(parts) != 2 or parts[0] not in {"confirm", "reject", "safe"}:
         await query.answer("Неизвестное действие.", show_alert=True)
         return
 
-    action, creator_text = parts
+    action, creator_txt = parts
     try:
-        creator_id = int(creator_text)
+        creator_id = int(creator_txt)
     except ValueError:
         await query.answer("Некорректное предложение.", show_alert=True)
         return
 
     if action == "safe":
         await query.answer(
-            "Этот бот не является гарантом или эскроу-сервисом. Деньги через него не проходят.",
+            "Бот не является эскроу-сервисом. Деньги через него не проходят.",
             show_alert=True,
         )
         return
@@ -309,597 +451,1059 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    message = query.message
-    if message is None:
+    msg = query.message
+    if not msg:
         await query.answer("Сообщение недоступно.", show_alert=True)
         return
 
-    offer_key = f"{message.chat_id}:{message.message_id}"
-    states: dict[str, dict[str, Any]] = context.bot_data.setdefault("offer_states", {})
-    if offer_key in states:
-        await query.answer("Для этого предложения действие уже зарегистрировано.", show_alert=True)
+    key = f"{msg.chat_id}:{msg.message_id}"
+    states: dict = ctx.bot_data.setdefault("offer_states", {})
+    if key in states:
+        await query.answer("Действие уже зарегистрировано.", show_alert=True)
         return
+    states[key] = {"action": action, "user_id": actor.id}
 
-    states[offer_key] = {"action": action, "user_id": actor.id}
-    display_name = html.escape(actor.full_name or actor.username or "Участник")
+    name = html.escape(actor.full_name or actor.username or "Участник")
     if actor.username:
-        display_name += f" (@{html.escape(actor.username)})"
+        name += f" (@{html.escape(actor.username)})"
 
     if action == "confirm":
-        status = (
-            f"\n\n{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Условия подтверждены</b>\n"
-            f"Участник: {display_name}\n"
+        suffix = (
+            f"\n\n{em(E_CONFIRM,'✅')} <b>Условия подтверждены</b>\n"
+            f"Участник: {name}\n"
             "Это не подтверждает оплату или передачу товара."
         )
-        answer_text = "Подтверждение зарегистрировано."
+        await query.answer("Подтверждение зарегистрировано.")
     else:
-        status = f"\n\n<b>Предложение отклонено</b>\nУчастник: {display_name}"
-        answer_text = "Отказ зарегистрирован."
+        suffix = f"\n\n<b>Предложение отклонено</b>\nУчастник: {name}"
+        await query.answer("Отказ зарегистрирован.")
 
-    await query.answer(answer_text)
-    # Update the offer card itself, removing its buttons without posting a second status message.
-    cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
-    original_html = cards.get(offer_key)
-    if original_html:
-        final_html = original_html + status
-    else:
-        # Fallback for old messages created before a process restart.
-        final_html = html.escape(message.text or "Предложение") + status
-
-    await safe_edit_text(
-        query,
-        final_html,
+    cards: dict = ctx.bot_data.setdefault("offer_cards", {})
+    original = cards.get(key, html.escape(msg.text or "Предложение"))
+    await safe_edit(
+        query, original + suffix,
         parse_mode=ParseMode.HTML,
         reply_markup=None,
         disable_web_page_preview=True,
     )
 
 
-async def receive_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.get("awaiting_offer"):
+# ─── Regular offer creation (non-Business DM) ────────────────────────────────
+
+async def receive_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.user_data.get("awaiting_offer"):
         return
 
-    message = update.effective_message
+    msg  = update.effective_message
     user = update.effective_user
-    if message is None or user is None or not message.text:
+    if not msg or not user or not msg.text:
         return
 
-    description = message.text.strip()
-    if description.lower() == "/cancel":
-        context.user_data.pop("awaiting_offer", None)
-        context.user_data.pop("flow_chat_id", None)
-        context.user_data.pop("flow_message_id", None)
-        await message.reply_text("Создание предложения отменено.", reply_markup=main_keyboard())
+    text = msg.text.strip()
+    if text.lower() == "/cancel":
+        ctx.user_data.clear()
+        await msg.reply_text("Отменено.", reply_markup=kb_main())
         return
 
-    if len(description) > MAX_OFFER_LENGTH:
-        await message.reply_text(
-            f"Слишком длинный текст. Максимум — {MAX_OFFER_LENGTH} символов. Сократите описание и отправьте снова."
+    if len(text) > MAX_OFFER_LEN:
+        await msg.reply_text(
+            f"Слишком длинный текст — максимум {MAX_OFFER_LEN} символов. Сократите и отправьте снова."
         )
         return
 
-    context.user_data.pop("awaiting_offer", None)
-    creator_name = html.escape(user.full_name or user.username or "Участник")
+    ctx.user_data.pop("awaiting_offer", None)
+
+    creator = html.escape(user.full_name or user.username or "Участник")
     if user.username:
-        creator_name += f" (@{html.escape(user.username)})"
+        creator += f" (@{html.escape(user.username)})"
 
     card = (
-        f"<b>{custom_emoji(EMOJI_OFFER, '📨')} Предложение</b>\n\n"
-        f"<b>Описание:</b>\n{html.escape(description)}\n\n"
-        f"<b>Создатель:</b> {creator_name}\n"
-        f"{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Подтверждение:</b> ожидается\n"
-        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Безопасная сделка:</b> проверяйте условия самостоятельно\n"
-        f"{custom_emoji(EMOJI_STARS, '⭐')} <b>Рейтинг:</b> не указан"
-        + warning_footer()
+        f"<b>{em(E_OFFER,'📨')} Предложение</b>\n\n"
+        f"<b>Описание:</b>\n{html.escape(text)}\n\n"
+        f"<b>Создатель:</b> {creator}\n"
+        f"{em(E_CONFIRM,'✅')} <b>Подтверждение:</b> ожидается\n"
+        f"{em(E_SHIELD,'🛡️')} <b>Безопасная сделка:</b> проверяйте условия самостоятельно"
+        + _warn()
     )
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Подтвердить условия", callback_data=f"confirm:{user.id}"),
-                InlineKeyboardButton("Отклонить", callback_data=f"reject:{user.id}"),
-            ],
-            [InlineKeyboardButton("Безопасная сделка — информация", callback_data=f"safe:{user.id}")],
-        ]
+    sent = await safe_send(
+        ctx,
+        chat_id=msg.chat_id,
+        text=card,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_offer(user.id),
+        disable_web_page_preview=True,
     )
-
-    # The card is the one expected new message. No additional "card created" message is sent.
-    try:
-        sent_card = await message.reply_text(
-            card,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-    except TelegramError as exc:
-        logger.exception("Could not send offer card: %s", exc)
-        await message.reply_text("Не удалось создать карточку. Попробуйте ещё раз через /start.")
+    if not sent:
+        await msg.reply_text("Не удалось создать карточку. Попробуйте ещё раз через /start.")
         return
 
-    key = f"{sent_card.chat_id}:{sent_card.message_id}"
-    cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
-    cards[key] = card
+    key = f"{sent.chat_id}:{sent.message_id}"
+    ctx.bot_data.setdefault("offer_cards", {})[key] = card
 
-    # Reuse the existing menu/prompt message as a compact status, rather than deleting it.
-    flow_chat_id = context.user_data.pop("flow_chat_id", None)
-    flow_message_id = context.user_data.pop("flow_message_id", None)
-    if flow_chat_id and flow_message_id:
+    flow_chat = ctx.user_data.pop("flow_chat_id", None)
+    flow_msg  = ctx.user_data.pop("flow_msg_id", None)
+    if flow_chat and flow_msg:
         try:
-            await context.bot.edit_message_text(
-                chat_id=flow_chat_id,
-                message_id=flow_message_id,
-                text="Предложение создано. Карточка отправлена выше.\n\n" + warning_footer(),
+            await ctx.bot.edit_message_text(
+                chat_id=flow_chat,
+                message_id=flow_msg,
+                text="Карточка создана и отправлена выше." + _warn(),
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard(),
+                reply_markup=kb_main(),
                 disable_web_page_preview=True,
             )
-        except TelegramError as exc:
-            logger.info("Could not update flow message in place: %s", exc)
+        except TelegramError as e:
+            log.info("Could not update flow message: %s", e)
 
 
-async def business_connection_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remember connection details and log whether Telegram permits replies."""
-    connection = update.business_connection
-    if connection is None:
+# ─── Business message handler ────────────────────────────────────────────────
+
+async def on_biz_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.business_message
+    if not msg or not msg.business_connection_id or not msg.text:
         return
 
-    rights = getattr(connection, "rights", None)
-    can_reply = getattr(rights, "can_reply", None) if rights is not None else None
-    connections: dict[str, dict[str, Any]] = context.bot_data.setdefault("business_connections", {})
-    connections[connection.id] = {
-        "user_id": connection.user.id,
-        "user_name": connection.user.full_name,
-        "is_enabled": connection.is_enabled,
-        "can_reply": can_reply,
-    }
-    logger.info(
-        "Business connection update received: id=%s enabled=%s owner_id=%s can_reply=%s",
-        connection.id,
-        connection.is_enabled,
-        connection.user.id,
-        can_reply,
+    conn_id = msg.business_connection_id
+    text    = msg.text.strip()
+
+    conn = await get_conn_info(conn_id, ctx)
+    if conn and not conn.get("is_enabled", True):
+        log.info("Business connection disabled, skipping: %s", conn_id)
+        return
+
+    # Ignore messages sent by the bot itself
+    if getattr(msg, "sender_business_bot", False):
+        return
+
+    sender   = msg.from_user
+    # The Business account owner is the person who connected the bot.
+    # conn["user_id"] is that owner's Telegram ID.
+    owner_id = int(conn["user_id"]) if conn and conn.get("user_id") else None
+    is_owner = bool(sender and owner_id and sender.id == owner_id)
+
+    parsed = parse_nft(text)
+
+    # ── OWNER writes .nft <amount> <link> in a chat with their buyer ─────────
+    # Any user who connected the bot can do this — no hardcoded seller ID.
+    if is_owner and parsed:
+        seller_id  = owner_id or 0
+        buyer_id   = int(msg.chat_id)
+        chat       = msg.chat
+        buyer_name = (
+            f"@{chat.username}" if getattr(chat, "username", None)
+            else (getattr(chat, "first_name", None) or f"Покупатель {buyer_id}")
+        )
+        sent_ok = await send_nft_card(
+            ctx, msg.chat_id, conn_id,
+            parsed[0], parsed[1],
+            seller_id, buyer_id, buyer_name,
+        )
+        if sent_ok:
+            # Delete the owner's .nft command so the chat stays clean
+            try:
+                await ctx.bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[msg.message_id],
+                )
+                log.info("Deleted .nft command: chat_id=%s msg_id=%s", msg.chat_id, msg.message_id)
+            except (AttributeError, TelegramError) as e:
+                log.warning("Could not delete .nft command: %s", e)
+        return
+
+    # ── BUYER accidentally types .nft → ignore silently ──────────────────────
+    if parsed or re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
+        return
+
+    # ── OWNER is mid-flow creating a regular offer card ──────────────────────
+    if is_owner and ctx.user_data.get("awaiting_biz_offer"):
+        await _finish_biz_offer(msg, ctx, conn_id)
+        return
+
+    # ── OWNER sends any other message → don't auto-reply ─────────────────────
+    if is_owner:
+        return
+
+    # ── Incoming message from BUYER → away reply ─────────────────────────────
+    sticker_id = os.getenv("PREMIUM_STICKER_FILE_ID", "").strip()
+    if sticker_id:
+        try:
+            await ctx.bot.send_sticker(
+                chat_id=msg.chat_id,
+                sticker=sticker_id,
+                business_connection_id=conn_id,
+            )
+        except TelegramError as e:
+            log.warning("Could not send sticker: %s", e)
+
+    await safe_send(
+        ctx,
+        chat_id=msg.chat_id,
+        connection_id=conn_id,
+        text="Привет... Незкс сейчас вернётся, либо он спит, а может быть и занят... Просто жди.",
+        disable_web_page_preview=True,
     )
 
 
-async def _get_business_connection_info(
-    connection_id: str, context: ContextTypes.DEFAULT_TYPE
-) -> dict[str, Any] | None:
-    """Use cached connection data; refresh it from Telegram when not cached."""
-    connections: dict[str, dict[str, Any]] = context.bot_data.setdefault("business_connections", {})
-    info = connections.get(connection_id)
-    if info is not None:
-        return info
-    try:
-        connection = await context.bot.get_business_connection(connection_id)
-        rights = getattr(connection, "rights", None)
-        info = {
-            "user_id": connection.user.id,
-            "user_name": connection.user.full_name,
-            "is_enabled": connection.is_enabled,
-            "can_reply": getattr(rights, "can_reply", None) if rights is not None else None,
-        }
-        connections[connection_id] = info
-        logger.info(
-            "Business connection details refreshed: id=%s enabled=%s can_reply=%s",
-            connection_id,
-            info["is_enabled"],
-            info["can_reply"],
-        )
-        return info
-    except (AttributeError, TelegramError) as exc:
-        logger.warning("Could not refresh Business connection %s: %s", connection_id, exc)
-        return None
-
-
-async def _finish_business_offer(
-    message: Any, context: ContextTypes.DEFAULT_TYPE, connection_id: str
-) -> None:
-    """Create the offer card as a message sent on behalf of the connected Business account."""
-    description = (message.text or "").strip()
-    if description.lower() == "/cancel":
-        context.user_data.pop("awaiting_business_offer", None)
-        context.user_data.pop("business_connection_id", None)
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Создание предложения отменено.",
-            reply_markup=main_keyboard(),
-        )
+async def _finish_biz_offer(msg: Any, ctx: ContextTypes.DEFAULT_TYPE, conn_id: str) -> None:
+    """Create an offer card from a Business chat text."""
+    text = msg.text.strip() if msg.text else ""
+    if text.lower() in {"/cancel", "отмена"}:
+        ctx.user_data.clear()
+        await safe_send(ctx, chat_id=msg.chat_id, connection_id=conn_id,
+                        text="Создание предложения отменено.", reply_markup=kb_main())
         return
 
-    if len(description) > MAX_OFFER_LENGTH:
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text=f"Слишком длинный текст. Максимум — {MAX_OFFER_LENGTH} символов. Сократите описание и отправьте снова.",
-        )
+    if len(text) > MAX_OFFER_LEN:
+        await safe_send(ctx, chat_id=msg.chat_id, connection_id=conn_id,
+                        text=f"Слишком длинный текст — максимум {MAX_OFFER_LEN} символов.")
         return
 
-    connection_info = await _get_business_connection_info(connection_id, context)
-    owner_id = int(connection_info["user_id"]) if connection_info and connection_info.get("user_id") else 0
-    owner_name = html.escape(str(connection_info.get("user_name") or "Бизнес-аккаунт")) if connection_info else "Бизнес-аккаунт"
+    ctx.user_data.pop("awaiting_biz_offer", None)
+
+    owner_id: int = ctx.user_data.get("biz_owner_id", 0)
     card = (
-        f"<b>{custom_emoji(EMOJI_OFFER, '📨')} Предложение</b>\n\n"
-        f"<b>Описание:</b>\n{html.escape(description)}\n\n"
-        f"<b>Отправитель:</b> {owner_name}\n"
-        f"{custom_emoji(EMOJI_CONFIRM, '✅')} <b>Подтверждение:</b> ожидается\n"
-        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Безопасная сделка:</b> проверяйте условия самостоятельно\n"
-        f"{custom_emoji(EMOJI_STARS, '⭐')} <b>Рейтинг:</b> не указан"
-        + warning_footer()
+        f"<b>{em(E_OFFER,'📨')} Предложение</b>\n\n"
+        f"<b>Описание:</b>\n{html.escape(text)}"
+        + _warn()
     )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Подтвердить условия", callback_data=f"confirm:{owner_id}"),
-                InlineKeyboardButton("Отклонить", callback_data=f"reject:{owner_id}"),
-            ],
-            [InlineKeyboardButton("Безопасная сделка — информация", callback_data=f"safe:{owner_id}")],
-        ]
+
+    sent = await safe_send(
+        ctx,
+        chat_id=msg.chat_id,
+        connection_id=conn_id,
+        text=card,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_offer(owner_id),
+        disable_web_page_preview=True,
     )
-    try:
-        sent_card = await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text=card,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-    except TelegramError as exc:
-        logger.exception("Could not send Business offer card: %s", exc)
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Не получилось отправить карточку. Проверьте в настройках Telegram Business право бота отвечать на сообщения.",
-        )
+    if not sent:
+        await safe_send(ctx, chat_id=msg.chat_id, connection_id=conn_id,
+                        text="Не удалось отправить карточку. Попробуйте ещё раз.")
         return
 
-    key = f"{sent_card.chat_id}:{sent_card.message_id}"
-    cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
-    cards[key] = card
-    context.user_data.pop("awaiting_business_offer", None)
-    context.user_data.pop("business_connection_id", None)
+    key = f"{sent.chat_id}:{sent.message_id}"
+    ctx.bot_data.setdefault("offer_cards", {})[key] = card
 
-    # Update the existing prompt in-place where Telegram allows it.
-    flow_chat_id = context.user_data.pop("flow_chat_id", None)
-    flow_message_id = context.user_data.pop("flow_message_id", None)
-    if flow_chat_id and flow_message_id:
+    flow_chat = ctx.user_data.pop("flow_chat_id", None)
+    flow_msg  = ctx.user_data.pop("flow_msg_id", None)
+    if flow_chat and flow_msg:
         try:
-            await context.bot.edit_message_text(
-                chat_id=flow_chat_id,
-                message_id=flow_message_id,
-                business_connection_id=connection_id,
-                text="Предложение создано. Карточка отправлена выше.\n\n" + warning_footer(),
+            await ctx.bot.edit_message_text(
+                chat_id=flow_chat,
+                message_id=flow_msg,
+                business_connection_id=conn_id,
+                text="Карточка создана и отправлена." + _warn(),
                 parse_mode=ParseMode.HTML,
-                reply_markup=main_keyboard(),
+                reply_markup=kb_main(),
                 disable_web_page_preview=True,
             )
-        except TelegramError as exc:
-            logger.info("Could not update Business prompt in place: %s", exc)
+        except TelegramError as e:
+            log.info("Could not update Business flow message: %s", e)
 
 
-def parse_nft_command(text: str) -> tuple[str, str] | None:
-    """Parse `.nft <amount> <URL>`, including bare t.me/nft/... links."""
-    # Search a whole command line so a heading like "NEZZX NFT СКУП:" before it
-    # doesn't break parsing. Accept both `https://t.me/...` and `t.me/...`.
-    match = re.search(
-        r"(?im)^\s*\.nft\s+(\d+(?:[.,]\d{1,2})?)\s+(\S+)\s*$",
-        text.strip(),
-    )
-    if not match:
-        return None
+# ─── NFT card sender ─────────────────────────────────────────────────────────
 
-    amount = match.group(1).replace(",", ".")
-    raw_url = match.group(2).rstrip(".,;)")
-    if raw_url.lower().startswith(("t.me/", "www.t.me/", "telegram.me/", "www.telegram.me/")):
-        raw_url = "https://" + raw_url
-
-    try:
-        from urllib.parse import urlsplit
-        parsed = urlsplit(raw_url)
-    except ValueError:
-        return None
-
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.path:
-        return None
-    # Reject malformed host strings and embedded credentials; don't accept javascript: etc.
-    host = (parsed.hostname or "").lower()
-    if not host or parsed.username or parsed.password:
-        return None
-    if not re.fullmatch(r"[a-z0-9.-]+", host):
-        return None
-
-    return amount, raw_url
-
-
-def _nft_details(url: str) -> tuple[str, str]:
-    """Return a readable Telegram collectible name and number where available."""
-    from urllib.parse import unquote, urlsplit
-
-    parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
-    path_parts = [unquote(part) for part in parsed.path.strip("/").split("/") if part]
-    if host in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"} and len(path_parts) >= 2 and path_parts[0].lower() == "nft":
-        slug = path_parts[1]
-        found = re.fullmatch(r"(.+?)-(\d+)", slug)
-        if found:
-            raw_name, serial = found.groups()
-            raw_name = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw_name)
-            raw_name = re.sub(r"[_-]+", " ", raw_name).strip()
-            return raw_name or "Telegram NFT", f"#{serial}"
-        return slug or "Telegram NFT", "не указан"
-    return "NFT по ссылке", "не указан"
-
-
-def _format_amount(amount: str) -> str:
-    try:
-        number = float(amount)
-        if number.is_integer():
-            return f"{int(number):,}".replace(",", " ")
-    except (TypeError, ValueError):
-        pass
-    return amount
-
-
-async def handle_nft_command(
-    message: Any,
-    context: ContextTypes.DEFAULT_TYPE,
-    connection_id: str,
+async def send_nft_card(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    conn_id: str | None,
     amount: str,
     url: str,
     seller_id: int,
     buyer_id: int,
     buyer_name: str,
-) -> None:
-    """Send a short NFT purchase offer on behalf of the connected Business account."""
-    from urllib.parse import urlsplit
+) -> bool:
+    keyboard = kb_nft(seller_id, buyer_id)
+    errors: list[str] = []
 
-    safe_url = html.escape(url, quote=True)
-    collectible_name, collectible_number = _nft_details(url)
-    display_amount = html.escape(_format_amount(amount))
-    safe_buyer = html.escape(buyer_name or "Покупатель")
-    host = (urlsplit(url).hostname or "").lower()
-    is_telegram_nft = host in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
-
-    # Keep the offer deliberately compact: buyer, amount, gift link, two actions only.
-    card = (
-        f"<b>{safe_buyer}</b> хочет купить ваш подарок за "
-        f"<b>{custom_emoji(EMOJI_STARS, '⭐')} {display_amount}</b> звёзд\n\n"
-        f"<b>{html.escape(collectible_name)}</b> · {html.escape(collectible_number)}\n"
-        f"<a href=\"{safe_url}\">Ссылка на подарок</a>"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Принять", callback_data=f"nft_accept:{seller_id}:{buyer_id}"),
-            InlineKeyboardButton("Отклонить", callback_data=f"nft_reject:{seller_id}:{buyer_id}"),
-        ]
-    ])
-
-    # The incoming customer's message cannot reliably be replaced by the bot.
-    # Send a formatted Business reply instead of silently failing to edit their message.
-    try:
-        sent = await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
+    # Try with custom emoji first, fall back to plain stars
+    for with_emoji in (True, False):
+        card = nft_card(buyer_name, amount, url, with_emoji=with_emoji)
+        sent = await safe_send(
+            ctx,
+            chat_id=chat_id,
+            connection_id=conn_id,
             text=card,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
             disable_web_page_preview=True,
+            error_sink=errors,
         )
-        key = f"{sent.chat_id}:{sent.message_id}"
-        cards: dict[str, str] = context.bot_data.setdefault("offer_cards", {})
-        cards[key] = card
-        offers: dict[str, dict[str, Any]] = context.bot_data.setdefault("nft_offers", {})
-        offers[key] = {
-            "seller_id": seller_id,
-            "buyer_id": buyer_id,
-            "buyer_name": buyer_name,
-            "amount": amount,
-            "url": url,
-            "business_connection_id": connection_id,
-            "is_telegram_nft": is_telegram_nft,
-        }
-        logger.info("NFT offer card sent: chat_id=%s message_id=%s buyer_id=%s", sent.chat_id, sent.message_id, buyer_id)
-    except TelegramError as exc:
-        logger.exception("Could not send NFT offer card: %s", exc)
-        try:
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                business_connection_id=connection_id,
-                text="Не удалось отправить предложение. Проверьте разрешение Business-бота отвечать в этом чате.",
-            )
-        except TelegramError:
-            logger.exception("Could not send NFT offer error message")
+        if sent:
+            key = f"{sent.chat_id}:{sent.message_id}"
+            ctx.bot_data.setdefault("offer_cards", {})[key] = card
+            ctx.bot_data.setdefault("nft_offers", {})[key] = {
+                "seller_id": seller_id,
+                "buyer_id":  buyer_id,
+                "amount":    amount,
+                "url":       url,
+                "conn_id":   conn_id,
+            }
+            log.info("NFT card sent: chat_id=%s msg_id=%s", sent.chat_id, sent.message_id)
+            return True
+        log.warning("NFT card send failed (with_emoji=%s), %s",
+                    with_emoji, "retrying plain" if with_emoji else "giving up")
 
-
-async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process normal text in Telegram Business chats and reply on behalf of the account."""
-    message = update.business_message
-    if message is None or not message.business_connection_id or not message.text:
-        return
-
-    connection_id = message.business_connection_id
-    text = message.text.strip()
-    logger.info(
-        "Incoming Business text update: connection_id=%s chat_id=%s text_length=%s",
-        connection_id,
-        message.chat_id,
-        len(text),
+    # Both attempts failed. Surface the exact Telegram rejection text in the
+    # chat itself — not just Render logs — so the real cause is visible
+    # immediately (TEMPORARY: revert to a clean customer-facing message once
+    # the root cause from this diagnostic is identified and fixed).
+    last_error = errors[-1] if errors else "no exception captured"
+    diag = html.escape(last_error[:300])
+    await safe_send(
+        ctx,
+        chat_id=chat_id,
+        connection_id=conn_id,
+        text=(
+            "Не удалось отправить карточку NFT. Диагностика:\n"
+            f"<code>{diag}</code>"
+        ),
+        parse_mode=ParseMode.HTML,
     )
+    return False
 
-    connection_info = await _get_business_connection_info(connection_id, context)
-    if connection_info and not connection_info.get("is_enabled", True):
-        logger.warning("Ignoring Business message because connection is disabled: %s", connection_id)
+
+# ─── Direct .nft in bot DM ───────────────────────────────────────────────────
+
+async def on_direct_nft(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    .nft typed directly in the bot's own DM chat.
+    The person typing IS the seller; buyer_id = 0 (preview mode, no counter-party).
+    """
+    msg  = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
         return
-    if connection_info and connection_info.get("can_reply") is False:
-        logger.warning(
-            "Business message received but the connection has no reply permission: connection_id=%s",
-            connection_id,
+
+    parsed = parse_nft(msg.text.strip())
+    if not parsed:
+        await msg.reply_text(
+            "Формат команды:\n<code>.nft 1000 t.me/nft/LibertyFigure-14469</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    sender = message.from_user
-    is_owner_message = bool(sender and connection_info and sender.id == connection_info.get("user_id"))
-    if getattr(message, "sender_business_bot", False):
+    # In a direct bot chat there is no buyer — seller_id = user, buyer_id = 0
+    seller_id  = user.id
+    buyer_id   = 0
+    buyer_name = "Покупатель"   # placeholder; no real buyer in DM preview
+
+    await send_nft_card(ctx, msg.chat_id, None, parsed[0], parsed[1],
+                        seller_id, buyer_id, buyer_name)
+
+
+# ─── Business connection update ──────────────────────────────────────────────
+
+async def on_biz_connection(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = update.business_connection
+    if not conn:
         return
-
-    # NFT purchase command is sent by the buyer in the seller's Business chat.
-    # Do not treat the connected account owner as the buyer of their own gift.
-    parsed_nft = parse_nft_command(text)
-    if parsed_nft:
-        if is_owner_message:
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                business_connection_id=connection_id,
-                text="Команду покупки должен отправить покупатель в этом чате: .nft 3500 t.me/nft/LibertyFigure-14469",
-            )
-            return
-        if not sender:
-            return
-        seller_id = int(connection_info.get("user_id") or 0) if connection_info else 0
-        if not seller_id:
-            logger.warning("Could not identify Business account owner for NFT offer: %s", connection_id)
-            return
-        buyer_name = f"@{sender.username}" if sender.username else (sender.full_name or f"Покупатель {sender.id}")
-        await handle_nft_command(
-            message, context, connection_id, *parsed_nft,
-            seller_id, sender.id, buyer_name,
-        )
-        return
-    if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Формат: .nft 3000 t.me/nft/LibertyFigure-14469",
-        )
-        return
-
-    if is_owner_message:
-        return
-
-    lowered = text.lower()
-    # Away reply for ordinary incoming messages. A real Premium sticker must be
-    # configured via PREMIUM_STICKER_FILE_ID (Telegram sticker file_id), since a
-    # custom emoji ID is not a sticker file_id. Never send the generic menu reply.
-    try:
-        sticker_id = os.getenv("PREMIUM_STICKER_FILE_ID", "").strip()
-        if sticker_id:
-            try:
-                await context.bot.send_sticker(
-                    chat_id=message.chat_id,
-                    sticker=sticker_id,
-                    business_connection_id=connection_id,
-                )
-            except TelegramError as sticker_exc:
-                logger.warning("Could not send configured away sticker: %s", sticker_exc)
-
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Привет... Незкс сейчас вернётся, либо он спит, а может быть и занят... Просто жди.",
-            disable_web_page_preview=True,
-        )
-    except TelegramError as exc:
-        logger.exception("Could not send Business away reply: %s", exc)
-
-
-async def show_sticker_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Return the file_id for a sticker sent to the bot in its private chat."""
-    message = update.effective_message
-    if message is None or message.sticker is None:
-        return
-    await message.reply_text(
-        "STICKER_FILE_ID для Render:\n" + message.sticker.file_id,
-        disable_web_page_preview=True,
+    rights = getattr(conn, "rights", None)
+    can_reply = getattr(rights, "can_reply", None) if rights else None
+    info = {
+        "user_id":    conn.user.id,
+        "user_name":  conn.user.full_name,
+        "is_enabled": conn.is_enabled,
+        "can_reply":  can_reply,
+    }
+    ctx.bot_data.setdefault("biz_connections", {})[conn.id] = info
+    log.info(
+        "Business connection: id=%s enabled=%s owner_id=%s can_reply=%s",
+        conn.id, conn.is_enabled, conn.user.id, can_reply,
     )
+    if can_reply is False:
+        log.warning(
+            "can_reply is False for connection %s — бот не сможет отвечать в Business чатах. "
+            "Переподключите бота и включите разрешение «Управление сообщениями».",
+            conn.id,
+        )
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("awaiting_offer", None)
-    context.user_data.pop("awaiting_business_offer", None)
-    context.user_data.pop("business_connection_id", None)
-    context.user_data.pop("flow_chat_id", None)
-    context.user_data.pop("flow_message_id", None)
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text("Создание предложения отменено.", reply_markup=main_keyboard())
+# ─── Sticker file_id helper ──────────────────────────────────────────────────
 
+async def on_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg and msg.sticker:
+        await msg.reply_text("PREMIUM_STICKER_FILE_ID для Render:\n" + msg.sticker.file_id)
+
+
+# ─── App lifecycle ───────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    token = os.getenv("BOT_TOKEN", "").strip()
-    secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    token    = os.getenv("BOT_TOKEN", "").strip()
+    secret   = os.getenv("WEBHOOK_SECRET", "").strip()
     base_url = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
 
     if not token:
-        raise RuntimeError("BOT_TOKEN is missing. Add your Telegram bot token in Render Environment.")
+        raise RuntimeError("BOT_TOKEN is missing.")
     if not secret or len(secret) < 8:
-        raise RuntimeError("Set WEBHOOK_SECRET in Render Environment (at least 8 characters; use letters, digits, _ or -).")
+        raise RuntimeError("WEBHOOK_SECRET must be at least 8 characters.")
     if not base_url.startswith("https://"):
-        raise RuntimeError("RENDER_EXTERNAL_URL was not found. Set WEBHOOK_URL to your Render HTTPS service URL.")
+        raise RuntimeError("WEBHOOK_URL / RENDER_EXTERNAL_URL must be an https:// URL.")
 
-    telegram_app = Application.builder().token(token).build()
-    # Use dedicated Business handlers. A catch-all TypeHandler(Update) is too broad
-    # and makes it harder to reason about handler priority in this application.
-    telegram_app.add_handler(BusinessConnectionHandler(business_connection_update))
-    telegram_app.add_handler(
-        MessageHandler(filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, business_message_reply)
-    )
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(CommandHandler("cancel", cancel_command))
-    telegram_app.add_handler(MessageHandler(filters.Sticker.ALL, show_sticker_file_id))
-    telegram_app.add_handler(CallbackQueryHandler(button_router))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_offer))
+    tg = Application.builder().token(token).build()
 
-    await telegram_app.initialize()
-    await telegram_app.start()
+    tg.add_handler(BusinessConnectionHandler(on_biz_connection))
+    tg.add_handler(MessageHandler(
+        filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT, on_biz_message
+    ))
+    tg.add_handler(CommandHandler("start",  cmd_start))
+    tg.add_handler(CommandHandler("help",   cmd_help))
+    tg.add_handler(CommandHandler("cancel", cmd_cancel))
+    tg.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
+    tg.add_handler(CallbackQueryHandler(on_button))
+    tg.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, _route_text
+    ))
+
+    await tg.initialize()
+    await tg.start()
+
     webhook_url = f"{base_url}{WEBHOOK_PATH}"
-    await telegram_app.bot.set_webhook(
+    await tg.bot.set_webhook(
         url=webhook_url,
         secret_token=secret,
         allowed_updates=Update.ALL_TYPES,
-        # Do not silently discard Business messages waiting during a Render restart/sleep.
         drop_pending_updates=False,
     )
-    fastapi_app.state.webhook_secret = secret
-    fastapi_app.state.telegram_app = telegram_app
-    logger.info("Telegram webhook configured at %s", webhook_url)
+    log.info("Webhook set: %s", webhook_url)
+    fastapi_app.state.tg               = tg
+    fastapi_app.state.secret           = secret
+    fastapi_app.state.seen_update_ids  = set()
+
     try:
         yield
     finally:
-        # Keep the webhook registered across Render restarts. Deleting it during every
-        # shutdown creates a delivery gap and can make Business chats appear unresponsive.
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+        await tg.stop()
+        await tg.shutdown()
 
 
-app = FastAPI(title="NEZZX Telegram Bot", lifespan=lifespan)
+async def _route_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route plain text in bot DM: .nft command or regular offer creation."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
+    if re.search(r"(?i)(?:^|\s)\.nft(?:\s|$)", text):
+        await on_direct_nft(update, ctx)
+    else:
+        await receive_offer(update, ctx)
 
 
-@app.get("/")
-async def root() -> dict[str, str]:
-    return {"service": "NEZZX Telegram Bot", "status": "running"}
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── DASHBOARD — Telethon personal account  ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.functions.contacts import SearchRequest
+    from telethon.errors import SessionPasswordNeededError
+    _TELETHON_OK = True
+except ImportError:
+    _TELETHON_OK = False
+    log.warning("telethon not installed — dashboard disabled")
+
+DASH_DB_PATH = os.getenv("DASH_DB", "/tmp/dash.db")
+DASH_API_ID   = int(os.getenv("TG_API_ID", "0") or "0")
+DASH_API_HASH = os.getenv("TG_API_HASH", "")
+
+# ─── DB helpers ──────────────────────────────────────────────────────────────
+
+def _dash_db():
+    conn = sqlite3.connect(DASH_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS dash_sessions(
+        token TEXT PRIMARY KEY,
+        tg_session TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '',
+        phone_code_hash TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'anon',
+        created_at INTEGER NOT NULL
+    )""")
+    conn.commit()
+    return conn
+
+@contextmanager
+def dash_db():
+    conn = _dash_db()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+def _dash_init():
+    with dash_db():
+        pass
+
+def _get_dash_session(token: str) -> dict | None:
+    with dash_db() as conn:
+        row = conn.execute("SELECT * FROM dash_sessions WHERE token=?", (token,)).fetchone()
+    return dict(row) if row else None
+
+def _set_dash_session(token: str, **kwargs):
+    with dash_db() as conn:
+        existing = conn.execute("SELECT token FROM dash_sessions WHERE token=?", (token,)).fetchone()
+        if existing:
+            sets = ", ".join(f"{k}=?" for k in kwargs)
+            conn.execute(f"UPDATE dash_sessions SET {sets} WHERE token=?",
+                         list(kwargs.values()) + [token])
+        else:
+            kwargs.setdefault("created_at", int(time.time()))
+            kwargs["token"] = token
+            cols = ", ".join(kwargs.keys())
+            vals = ", ".join("?" * len(kwargs))
+            conn.execute(f"INSERT INTO dash_sessions({cols}) VALUES({vals})",
+                         list(kwargs.values()))
+
+# ─── Telethon client factory ──────────────────────────────────────────────────
+
+def _make_client(session_str: str = "") -> "TelegramClient":
+    return TelegramClient(
+        StringSession(session_str),
+        DASH_API_ID, DASH_API_HASH,
+        device_model="NEZZX Dashboard",
+        system_version="Linux",
+        app_version="1.0",
+    )
+
+# ─── Cookie auth dependency ───────────────────────────────────────────────────
+
+COOKIE_NAME = "nezzx_dash"
+
+def _dash_token(request: Request) -> str | None:
+    return request.cookies.get(COOKIE_NAME)
+
+async def _require_auth(request: Request) -> dict:
+    token = _dash_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="not_logged_in")
+    sess = _get_dash_session(token)
+    if not sess or sess["state"] != "ready":
+        raise HTTPException(status_code=401, detail="not_logged_in")
+    return sess
+
+# ─── Dashboard HTML ───────────────────────────────────────────────────────────
+
+_DASH_HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEZZX Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}
+.app{max-width:560px;margin:0 auto;padding:16px}
+h1{font-size:20px;font-weight:700;margin-bottom:20px;color:#58a6ff}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:15px;font-weight:600;margin-bottom:14px;color:#8b949e}
+input,textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:8px;
+  color:#e6edf3;padding:10px 12px;font-size:14px;outline:none;margin-bottom:10px}
+input:focus,textarea:focus{border-color:#58a6ff}
+button{width:100%;padding:11px;border:none;border-radius:8px;font-size:14px;font-weight:600;
+  cursor:pointer;transition:.15s}
+.btn-primary{background:#238636;color:#fff}
+.btn-primary:hover{background:#2ea043}
+.btn-secondary{background:#21262d;color:#e6edf3;border:1px solid #30363d}
+.btn-secondary:hover{background:#30363d}
+.btn-danger{background:#da3633;color:#fff}
+.btn-sm{width:auto;padding:6px 14px;font-size:13px}
+.err{color:#f85149;font-size:13px;margin-top:-6px;margin-bottom:8px}
+.ok{color:#3fb950;font-size:13px;margin-top:-6px;margin-bottom:8px}
+.chat-list{list-style:none}
+.chat-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;
+  cursor:pointer;transition:.12s;border:1px solid transparent;margin-bottom:4px}
+.chat-item:hover{background:#21262d;border-color:#30363d}
+.chat-item.selected{background:#1f2d3d;border-color:#58a6ff}
+.avatar{width:38px;height:38px;border-radius:50%;background:#238636;display:flex;
+  align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0}
+.chat-name{font-size:14px;font-weight:500}
+.chat-sub{font-size:12px;color:#8b949e;margin-top:2px}
+.badge{background:#58a6ff;color:#0d1117;border-radius:10px;padding:1px 7px;font-size:11px;
+  font-weight:700;margin-left:auto}
+.sep{border:none;border-top:1px solid #21262d;margin:12px 0}
+.loader{text-align:center;color:#8b949e;padding:20px;font-size:13px}
+.tag{display:inline-block;background:#21262d;border-radius:6px;padding:2px 8px;
+  font-size:12px;color:#8b949e;margin-right:4px}
+#nft-panel{display:none}
+</style>
+</head>
+<body>
+<div class="app">
+<h1>⚡ NEZZX Dashboard</h1>
+<div id="root"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const root = () => $('root');
+
+let state = {view:'loading', selected:null};
+
+async function api(path, opts={}) {
+  const r = await fetch('/dash/api' + path, {
+    method: opts.method || 'GET',
+    headers: opts.body ? {'Content-Type':'application/json'} : {},
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const d = await r.json().catch(()=>({}));
+  if (!r.ok) throw d;
+  return d;
+}
+
+function showErr(el, msg) {
+  const e = typeof el === 'string' ? $(el) : el;
+  if (e) { e.className='err'; e.textContent=msg; }
+}
+function showOk(el, msg) {
+  const e = typeof el === 'string' ? $(el) : el;
+  if (e) { e.className='ok'; e.textContent=msg; }
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+function renderLogin(step='phone') {
+  root().innerHTML = `
+<div class="card">
+  <h2>Вход в аккаунт Telegram</h2>
+  ${step==='phone'?`
+  <input id="phone" type="tel" placeholder="+79991234567" autocomplete="tel">
+  <div id="msg" class="err"></div>
+  <button class="btn-primary" onclick="sendPhone()">Получить код</button>
+  `:`
+  <p style="font-size:13px;color:#8b949e;margin-bottom:12px">
+    Код отправлен в Telegram. Введите его ниже.</p>
+  <input id="code" type="text" placeholder="12345" maxlength="10" autocomplete="one-time-code">
+  <input id="pass2fa" type="password" placeholder="Пароль 2FA (если есть)" style="display:none">
+  <div id="msg" class="err"></div>
+  <button class="btn-primary" onclick="sendCode()">Войти</button>
+  `}
+</div>`;
+}
+
+async function sendPhone() {
+  const phone = $('phone').value.trim();
+  if (!phone) return showErr('msg','Введите номер');
+  $('msg').textContent = 'Отправляем...';
+  try {
+    await api('/send_code', {method:'POST', body:{phone}});
+    renderLogin('code');
+  } catch(e) { showErr('msg', e.detail || 'Ошибка'); }
+}
+
+async function sendCode() {
+  const code = $('code').value.trim();
+  const pass = $('pass2fa') ? $('pass2fa').value : '';
+  if (!code) return showErr('msg','Введите код');
+  $('msg').textContent = 'Проверяем...';
+  try {
+    await api('/verify_code', {method:'POST', body:{code, password:pass}});
+    init();
+  } catch(e) {
+    if (e.detail === '2fa_required') {
+      $('pass2fa').style.display = 'block';
+      showErr('msg','Введите пароль 2FA и нажмите Войти снова');
+    } else {
+      showErr('msg', e.detail || 'Неверный код');
+    }
+  }
+}
+
+// ── Main view ──────────────────────────────────────────────────────────────────
+function renderMain(chats) {
+  root().innerHTML = `
+<div class="card">
+  <h2>Поиск по юзернейму</h2>
+  <input id="search-q" type="text" placeholder="@username или имя" style="margin-bottom:6px">
+  <div id="search-msg" class="err"></div>
+  <button class="btn-secondary btn-sm" style="margin-bottom:0" onclick="doSearch()">Найти</button>
+</div>
+<div class="card">
+  <h2>Мои чаты <span style="font-size:12px;color:#8b949e">(последние 30)</span></h2>
+  <ul class="chat-list" id="chat-list">
+    ${chats.map(c=>`
+    <li class="chat-item" onclick="selectChat(${c.id},'${esc(c.name)}','${esc(c.username||'')}')">
+      <div class="avatar" style="background:${avatarColor(c.name)}">${c.name[0]||'?'}</div>
+      <div>
+        <div class="chat-name">${esc(c.name)}</div>
+        ${c.username?`<div class="chat-sub">@${esc(c.username)}</div>`:''}
+      </div>
+      ${c.unread?`<span class="badge">${c.unread}</span>`:''}
+    </li>`).join('')}
+  </ul>
+</div>
+<div class="card" id="nft-panel">
+  <h2>Отправить NFT-карточку → <span id="nft-to" style="color:#58a6ff"></span></h2>
+  <input id="nft-amount" type="number" placeholder="Сумма звёзд (напр. 1000)">
+  <input id="nft-url" type="text" placeholder="https://t.me/nft/LibertyFigure-14469">
+  <div id="nft-msg" class="err"></div>
+  <button class="btn-primary" onclick="sendNftCard()">Отправить карточку</button>
+  <hr class="sep">
+  <button class="btn-secondary" onclick="closeNft()">Отмена</button>
+</div>`;
+}
+
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+function avatarColor(n){ const h=['#238636','#1158a7','#6e40c9','#bf8700','#953800'];return h[n.charCodeAt(0)%h.length] }
+
+function selectChat(id, name, username) {
+  state.selected = {id, name, username};
+  document.querySelectorAll('.chat-item').forEach(el=>el.classList.remove('selected'));
+  const all = document.querySelectorAll('.chat-item');
+  all.forEach(el=>{ if(el.onclick && el.onclick.toString().includes(String(id))) el.classList.add('selected') });
+  $('nft-panel').style.display = 'block';
+  $('nft-to').textContent = name + (username ? ' (@'+username+')' : '');
+  $('nft-msg').textContent = '';
+  $('nft-panel').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+function closeNft() {
+  $('nft-panel').style.display = 'none';
+  state.selected = null;
+  document.querySelectorAll('.chat-item').forEach(el=>el.classList.remove('selected'));
+}
+
+async function doSearch() {
+  const q = $('search-q').value.trim();
+  if (!q) return;
+  $('search-msg').textContent = 'Ищем...';
+  try {
+    const d = await api('/search?q=' + encodeURIComponent(q));
+    if (!d.results.length) { showErr('search-msg','Никого не нашли'); return; }
+    $('search-msg').textContent = '';
+    const list = $('chat-list');
+    const item = d.results[0];
+    // prepend result
+    const li = document.createElement('li');
+    li.className = 'chat-item';
+    li.innerHTML = `
+      <div class="avatar" style="background:#1158a7">${item.name[0]||'?'}</div>
+      <div>
+        <div class="chat-name">${esc(item.name)} <span class="tag">найден</span></div>
+        ${item.username?'<div class="chat-sub">@'+esc(item.username)+'</div>':''}
+      </div>`;
+    li.onclick = ()=>selectChat(item.id, item.name, item.username||'');
+    list.prepend(li);
+    li.scrollIntoView({behavior:'smooth',block:'nearest'});
+  } catch(e){ showErr('search-msg', e.detail||'Ошибка поиска') }
+}
+
+async function sendNftCard() {
+  const amount = $('nft-amount').value.trim();
+  const url    = $('nft-url').value.trim();
+  if (!amount || !url) return showErr('nft-msg','Заполните оба поля');
+  if (!state.selected) return showErr('nft-msg','Выберите чат');
+  $('nft-msg').textContent = 'Отправляем...';
+  try {
+    await api('/send_nft', {method:'POST', body:{
+      chat_id: state.selected.id,
+      chat_name: state.selected.name,
+      amount, url
+    }});
+    showOk('nft-msg','✅ Карточка отправлена!');
+    $('nft-amount').value=''; $('nft-url').value='';
+  } catch(e){ showErr('nft-msg', e.detail||'Ошибка отправки') }
+}
+
+async function init() {
+  try {
+    const d = await api('/me');
+    if (!d.ok) { renderLogin(); return; }
+  } catch(e) { renderLogin(); return; }
+  root().innerHTML = '<div class="loader">Загружаем чаты...</div>';
+  try {
+    const d = await api('/chats');
+    renderMain(d.chats);
+  } catch(e) { root().innerHTML = '<div class="loader">Ошибка загрузки чатов</div>'; }
+}
+
+init();
+</script>
+</body>
+</html>"""
+
+# ─── FastAPI ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="NEZZX Bot", lifespan=lifespan)
+
+
+_dash_init()
+
+# ─── Dashboard routes ─────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTMLResponse(_DASH_HTML)
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict:
     return {"status": "ok"}
+
+@app.get("/dash", response_class=HTMLResponse)
+async def dash_page():
+    return HTMLResponse(_DASH_HTML)
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class PhoneBody(BaseModel):
+    phone: str = Field(min_length=5, max_length=20)
+
+class CodeBody(BaseModel):
+    code: str = Field(min_length=1, max_length=20)
+    password: str = Field(default="", max_length=200)
+
+class SendNftBody(BaseModel):
+    chat_id: int
+    chat_name: str = Field(max_length=200)
+    amount: str = Field(min_length=1, max_length=20)
+    url: str = Field(min_length=5, max_length=500)
+
+# ── /dash/api/send_code ───────────────────────────────────────────────────────
+
+@app.post("/dash/api/send_code")
+async def dash_send_code(payload: PhoneBody, request: Request, response: Response):
+    if not _TELETHON_OK:
+        raise HTTPException(503, "Telethon не установлен. Добавьте telethon в requirements.txt")
+    if not DASH_API_ID or not DASH_API_HASH:
+        raise HTTPException(503, "Добавьте TG_API_ID и TG_API_HASH в переменные окружения Render")
+
+    token = _dash_token(request) or secrets.token_urlsafe(32)
+    client = _make_client()
+    try:
+        await client.connect()
+        result = await client.send_code_request(payload.phone)
+        session_str = client.session.save()
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    finally:
+        await client.disconnect()
+
+    _set_dash_session(token,
+        tg_session=session_str,
+        phone=payload.phone,
+        phone_code_hash=result.phone_code_hash,
+        state="code_sent",
+        created_at=int(time.time()),
+    )
+    response.set_cookie(COOKIE_NAME, token, max_age=86400*30, httponly=True, samesite="lax")
+    return {"ok": True}
+
+# ── /dash/api/verify_code ─────────────────────────────────────────────────────
+
+@app.post("/dash/api/verify_code")
+async def dash_verify_code(payload: CodeBody, request: Request, response: Response):
+    token = _dash_token(request)
+    sess = token and _get_dash_session(token)
+    if not sess or sess["state"] not in ("code_sent", "2fa"):
+        raise HTTPException(401, "Начните заново — отправьте номер")
+
+    client = _make_client(sess["tg_session"])
+    try:
+        await client.connect()
+        if sess["state"] == "2fa" or (payload.password and sess["state"] == "code_sent"):
+            # 2FA flow
+            try:
+                await client.sign_in(password=payload.password)
+            except Exception as e:
+                raise HTTPException(400, str(e))
+        else:
+            try:
+                await client.sign_in(
+                    phone=sess["phone"],
+                    code=payload.code,
+                    phone_code_hash=sess["phone_code_hash"],
+                )
+            except SessionPasswordNeededError:
+                session_str = client.session.save()
+                _set_dash_session(token, tg_session=session_str, state="2fa")
+                await client.disconnect()
+                raise HTTPException(400, "2fa_required")
+            except Exception as e:
+                raise HTTPException(400, str(e))
+
+        session_str = client.session.save()
+    finally:
+        await client.disconnect()
+
+    _set_dash_session(token, tg_session=session_str, state="ready")
+    response.set_cookie(COOKIE_NAME, token, max_age=86400*30, httponly=True, samesite="lax")
+    return {"ok": True}
+
+# ── /dash/api/me ──────────────────────────────────────────────────────────────
+
+@app.get("/dash/api/me")
+async def dash_me(request: Request):
+    token = _dash_token(request)
+    sess = token and _get_dash_session(token)
+    if not sess or sess["state"] != "ready":
+        raise HTTPException(401, "not_logged_in")
+    client = _make_client(sess["tg_session"])
+    try:
+        await client.connect()
+        me = await client.get_me()
+        return {"ok": True, "id": me.id, "name": me.first_name,
+                "username": me.username or ""}
+    except Exception as e:
+        raise HTTPException(401, str(e))
+    finally:
+        await client.disconnect()
+
+# ── /dash/api/chats ───────────────────────────────────────────────────────────
+
+@app.get("/dash/api/chats")
+async def dash_chats(request: Request):
+    sess = await _require_auth(request)
+    client = _make_client(sess["tg_session"])
+    try:
+        await client.connect()
+        dialogs = await client.get_dialogs(limit=30)
+        chats = []
+        for d in dialogs:
+            e = d.entity
+            name = getattr(e, "first_name", None) or getattr(e, "title", None) or "Unknown"
+            last = getattr(e, "last_name", None)
+            if last:
+                name = name + " " + last
+            chats.append({
+                "id": e.id,
+                "name": name,
+                "username": getattr(e, "username", None) or "",
+                "unread": d.unread_count,
+            })
+        return {"chats": chats}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        await client.disconnect()
+
+# ── /dash/api/search ──────────────────────────────────────────────────────────
+
+@app.get("/dash/api/search")
+async def dash_search(q: str, request: Request):
+    sess = await _require_auth(request)
+    if not q.strip():
+        raise HTTPException(422, "Введите запрос")
+    client = _make_client(sess["tg_session"])
+    try:
+        await client.connect()
+        results = []
+        # Try resolve by username first
+        try:
+            entity = await client.get_entity(q.lstrip("@"))
+            name = getattr(entity, "first_name", None) or getattr(entity, "title", None) or q
+            last = getattr(entity, "last_name", None)
+            if last:
+                name = name + " " + last
+            results.append({
+                "id": entity.id,
+                "name": name,
+                "username": getattr(entity, "username", None) or "",
+            })
+        except Exception:
+            pass
+        # Also try global search
+        if not results and _TELETHON_OK:
+            try:
+                r = await client(SearchRequest(q=q, limit=5))
+                for u in (r.users if hasattr(r, "users") else []):
+                    name = (u.first_name or "") + (" " + u.last_name if u.last_name else "")
+                    results.append({"id": u.id, "name": name.strip() or q,
+                                    "username": u.username or ""})
+            except Exception:
+                pass
+        if not results:
+            raise HTTPException(404, "Пользователь не найден")
+        return {"results": results[:5]}
+    finally:
+        await client.disconnect()
+
+# ── /dash/api/send_nft ────────────────────────────────────────────────────────
+
+@app.post("/dash/api/send_nft")
+async def dash_send_nft(payload: SendNftBody, request: Request):
+    sess = await _require_auth(request)
+
+    # Validate NFT url via existing parse_nft logic
+    nft_text = f".nft {payload.amount} {payload.url}"
+    parsed = parse_nft(nft_text)
+    if not parsed:
+        raise HTTPException(422, "Неверная сумма или ссылка NFT")
+
+    amount, url = parsed
+    client = _make_client(sess["tg_session"])
+    try:
+        await client.connect()
+        me = await client.get_me()
+        seller_id = me.id
+
+        entity = await client.get_entity(payload.chat_id)
+        buyer_name = (
+            getattr(entity, "username", None)
+            and f"@{entity.username}"
+            or getattr(entity, "first_name", None)
+            or payload.chat_name
+        )
+
+        # Build card text (same logic as nft_card but send via Telethon)
+        nft_name, nft_num = nft_details(url)
+        label = f"{nft_name} · {nft_num}" if nft_num else nft_name
+        safe_url = url
+        card_md = (
+            f"**{buyer_name}** хочет купить ваш подарок за "
+            f"**⭐ {fmt_amount(amount)}** звёзд\n\n"
+            f"{label}\n[Ссылка на подарок]({safe_url})"
+        )
+        await client.send_message(payload.chat_id, card_md, link_preview=False)
+        log.info("Dashboard NFT card sent to chat_id=%s amount=%s", payload.chat_id, amount)
+        return {"ok": True}
+    except Exception as e:
+        err = str(e)
+        if "peer_flood" in err.lower() or "flood" in err.lower():
+            raise HTTPException(429, "Telegram ограничил отправку (PEER_FLOOD). Подождите несколько часов.")
+        raise HTTPException(500, err)
+    finally:
+        await client.disconnect()
 
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    expected_secret = getattr(request.app.state, "webhook_secret", "")
-    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not expected_secret or supplied_secret != expected_secret:
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    expected = getattr(request.app.state, "secret", "")
+    supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected or supplied != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    tg_app: Application = request.app.state.telegram_app
+    tg: Application = request.app.state.tg
     try:
         payload = await request.json()
-        update = Update.de_json(payload, tg_app.bot)
-        await tg_app.process_update(update)
-    except Exception as exc:
-        logger.exception("Failed to process update: %s", exc)
+        update_id = payload.get("update_id")
+
+        # Telegram redelivers an update if it doesn't get a timely 200 OK
+        # (e.g. Render free-tier cold start). Without this guard a slow
+        # first attempt plus a retry both run to completion, producing
+        # duplicate sends/replies for one incoming message.
+        seen: set = request.app.state.seen_update_ids
+        if update_id is not None:
+            if update_id in seen:
+                log.info("Duplicate update_id=%s ignored (webhook retry)", update_id)
+                return {"ok": True}
+            seen.add(update_id)
+            if len(seen) > 2000:
+                seen.clear()
+
+        log.info(
+            "Update received: update_id=%s keys=%s",
+            update_id,
+            [k for k, v in payload.items() if v is not None],
+        )
+        update = Update.de_json(payload, tg.bot)
+        # ACK Telegram immediately; process in the background so a slow
+        # handler (e.g. two sequential send_message calls) can never itself
+        # cause Telegram to time out and retry.
+        background_tasks.add_task(tg.process_update, update)
+    except Exception as e:
+        log.exception("Failed to process update: %s", e)
         return JSONResponse(status_code=500, content={"ok": False})
     return {"ok": True}
