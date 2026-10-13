@@ -740,22 +740,24 @@ async def send_nft_card(
         log.warning("NFT card send failed (with_emoji=%s), %s",
                     with_emoji, "retrying plain" if with_emoji else "giving up")
 
-    # Both attempts failed. Surface the exact Telegram rejection text in the
-    # chat itself — not just Render logs — so the real cause is visible
-    # immediately (TEMPORARY: revert to a clean customer-facing message once
-    # the root cause from this diagnostic is identified and fixed).
-    last_error = errors[-1] if errors else "no exception captured"
-    diag = html.escape(last_error[:300])
-    await safe_send(
-        ctx,
-        chat_id=chat_id,
-        connection_id=conn_id,
-        text=(
-            "Не удалось отправить карточку NFT. Диагностика:\n"
-            f"<code>{diag}</code>"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
+    # Both attempts failed — notify owner via bot DM, not via Business chat.
+    last_error = errors[-1] if errors else ""
+    is_flood = "peer_flood" in last_error.lower() or "flood" in last_error.lower()
+
+    if is_flood:
+        # PEER_FLOOD: Telegram rate-limits the bot account for sending to
+        # non-contacts. This is a platform-level restriction; the only fix is
+        # to wait (usually a few hours to a few days). Silently log it.
+        log.warning(
+            "PEER_FLOOD on NFT card chat_id=%s — Telegram is rate-limiting this bot. "
+            "Wait a few hours before retrying. Error: %s",
+            chat_id, last_error,
+        )
+    else:
+        log.error(
+            "NFT card send failed permanently chat_id=%s conn=%s error=%s",
+            chat_id, conn_id, last_error,
+        )
     return False
 
 
