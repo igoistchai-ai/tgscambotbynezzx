@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -209,8 +209,15 @@ async def get_conn_info(connection_id: str, ctx: ContextTypes.DEFAULT_TYPE) -> d
 # ─── Safe send helpers ───────────────────────────────────────────────────────
 
 async def safe_send(ctx: ContextTypes.DEFAULT_TYPE, *, chat_id: int,
-                    connection_id: str | None = None, **kwargs) -> Any | None:
-    """Send a message; return the sent Message or None on failure."""
+                    connection_id: str | None = None,
+                    error_sink: list[str] | None = None,
+                    **kwargs) -> Any | None:
+    """Send a message; return the sent Message or None on failure.
+
+    If error_sink is passed, the exact Telegram error text is appended to it,
+    so a caller can surface the real rejection reason to the chat/logs instead
+    of a generic failure notice.
+    """
     kw: dict = {"chat_id": chat_id, **kwargs}
     if connection_id:
         kw["business_connection_id"] = connection_id
@@ -218,6 +225,8 @@ async def safe_send(ctx: ContextTypes.DEFAULT_TYPE, *, chat_id: int,
         return await ctx.bot.send_message(**kw)
     except TelegramError as e:
         log.exception("send_message failed chat_id=%s conn=%s: %s", chat_id, connection_id, e)
+        if error_sink is not None:
+            error_sink.append(str(e))
         return None
 
 
@@ -701,6 +710,7 @@ async def send_nft_card(
     buyer_name: str,
 ) -> bool:
     keyboard = kb_nft(seller_id, buyer_id)
+    errors: list[str] = []
 
     # Try with custom emoji first, fall back to plain stars
     for with_emoji in (True, False):
@@ -713,6 +723,7 @@ async def send_nft_card(
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
             disable_web_page_preview=True,
+            error_sink=errors,
         )
         if sent:
             key = f"{sent.chat_id}:{sent.message_id}"
@@ -729,12 +740,21 @@ async def send_nft_card(
         log.warning("NFT card send failed (with_emoji=%s), %s",
                     with_emoji, "retrying plain" if with_emoji else "giving up")
 
-    # Both attempts failed — notify owner
+    # Both attempts failed. Surface the exact Telegram rejection text in the
+    # chat itself — not just Render logs — so the real cause is visible
+    # immediately (TEMPORARY: revert to a clean customer-facing message once
+    # the root cause from this diagnostic is identified and fixed).
+    last_error = errors[-1] if errors else "no exception captured"
+    diag = html.escape(last_error[:300])
     await safe_send(
         ctx,
         chat_id=chat_id,
         connection_id=conn_id,
-        text="Не удалось отправить карточку NFT. Проверьте права бота и попробуйте снова.",
+        text=(
+            "Не удалось отправить карточку NFT. Диагностика:\n"
+            f"<code>{diag}</code>"
+        ),
+        parse_mode=ParseMode.HTML,
     )
     return False
 
@@ -844,8 +864,9 @@ async def lifespan(fastapi_app: FastAPI):
         drop_pending_updates=False,
     )
     log.info("Webhook set: %s", webhook_url)
-    fastapi_app.state.tg      = tg
-    fastapi_app.state.secret  = secret
+    fastapi_app.state.tg               = tg
+    fastapi_app.state.secret           = secret
+    fastapi_app.state.seen_update_ids  = set()
 
     try:
         yield
@@ -882,7 +903,7 @@ async def health() -> dict:
 
 
 @app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     expected = getattr(request.app.state, "secret", "")
     supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not expected or supplied != expected:
@@ -891,13 +912,31 @@ async def webhook(request: Request):
     tg: Application = request.app.state.tg
     try:
         payload = await request.json()
+        update_id = payload.get("update_id")
+
+        # Telegram redelivers an update if it doesn't get a timely 200 OK
+        # (e.g. Render free-tier cold start). Without this guard a slow
+        # first attempt plus a retry both run to completion, producing
+        # duplicate sends/replies for one incoming message.
+        seen: set = request.app.state.seen_update_ids
+        if update_id is not None:
+            if update_id in seen:
+                log.info("Duplicate update_id=%s ignored (webhook retry)", update_id)
+                return {"ok": True}
+            seen.add(update_id)
+            if len(seen) > 2000:
+                seen.clear()
+
         log.info(
             "Update received: update_id=%s keys=%s",
-            payload.get("update_id"),
+            update_id,
             [k for k, v in payload.items() if v is not None],
         )
         update = Update.de_json(payload, tg.bot)
-        await tg.process_update(update)
+        # ACK Telegram immediately; process in the background so a slow
+        # handler (e.g. two sequential send_message calls) can never itself
+        # cause Telegram to time out and retry.
+        background_tasks.add_task(tg.process_update, update)
     except Exception as e:
         log.exception("Failed to process update: %s", e)
         return JSONResponse(status_code=500, content={"ok": False})
