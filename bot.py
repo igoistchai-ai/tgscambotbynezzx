@@ -51,23 +51,13 @@ def warning_footer() -> str:
 
 
 def welcome_text() -> str:
-    return (
-        "<b>NEZZX — предложения и сделки</b>\n\n"
-        "Создайте предложение с описанием условий, затем отправьте карточку второму участнику.\n\n"
-        f"{custom_emoji(EMOJI_SAFE_DEAL, '🛡️')} <b>Важно:</b> бот не принимает, не хранит и не переводит деньги. "
-        "Он не является эскроу-сервисом и не подтверждает факт оплаты."
-        + warning_footer()
-    )
+    # The private bot is only an entry point; deals are handled in Business chats.
+    return "Сделки тут."
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Создать предложение", callback_data="create_offer")],
-            [InlineKeyboardButton("Безопасная сделка", callback_data="safe_deal")],
-            [InlineKeyboardButton("Как это работает", callback_data="how_it_works")],
-        ]
-    )
+def main_keyboard() -> InlineKeyboardMarkup | None:
+    # No deal-creation menu in the bot's private chat.
+    return None
 
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
@@ -106,15 +96,12 @@ async def safe_edit_text(query: Any, text: str, **kwargs: Any) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_offer", None)
+    context.user_data.pop("awaiting_business_offer", None)
+    context.user_data.pop("business_connection_id", None)
     context.user_data.pop("flow_message_id", None)
     message = update.effective_message
     if message is not None:
-        await message.reply_text(
-            welcome_text(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-            disable_web_page_preview=True,
-        )
+        await message.reply_text("Сделки тут.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,7 +748,11 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
     parsed_nft = parse_nft_command(text)
     if parsed_nft:
         if is_owner_message:
-            # The seller's own command must not create an offer or trigger an auto-reply.
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                business_connection_id=connection_id,
+                text="Команду покупки должен отправить покупатель в этом чате: .nft 3500 t.me/nft/LibertyFigure-14469",
+            )
             return
         if not sender:
             return
@@ -787,40 +778,6 @@ async def business_message_reply(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     lowered = text.lower()
-    if context.user_data.get("awaiting_business_offer"):
-        await _finish_business_offer(message, context, connection_id)
-        return
-
-    if lowered in {"/cancel", "отмена"}:
-        context.user_data.pop("awaiting_business_offer", None)
-        context.user_data.pop("business_connection_id", None)
-        await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text="Сейчас нет активного создания предложения.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    if "создать предложение" in lowered or lowered == "предложение":
-        context.user_data["awaiting_business_offer"] = True
-        context.user_data["business_connection_id"] = connection_id
-        prompt = await context.bot.send_message(
-            chat_id=message.chat_id,
-            business_connection_id=connection_id,
-            text=(
-                "<b>Создание предложения</b>\n\n"
-                "Отправьте одним сообщением описание предложения и условия.\n"
-                "Не указывайте пароли, коды подтверждения или полные данные банковских карт."
-                + warning_footer()
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_keyboard(),
-        )
-        context.user_data["flow_chat_id"] = prompt.chat_id
-        context.user_data["flow_message_id"] = prompt.message_id
-        return
-
     # Away reply for ordinary incoming messages. A real Premium sticker must be
     # configured via PREMIUM_STICKER_FILE_ID (Telegram sticker file_id), since a
     # custom emoji ID is not a sticker file_id. Never send the generic menu reply.
